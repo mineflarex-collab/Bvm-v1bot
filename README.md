@@ -1,8 +1,7 @@
 # Bvm Vps V1 Bot — LXC Edition
 
 Made by **MineFlareX**
-Repo: https://github.com/<your-username>/Bvm-v1bot
-
+Repo: https://github.com/mineflarex-collab/Bvm-v1bot
 Fully automated Discord bot for managing LXC/LXD-based VPS containers — creation, resizing, suspension, port forwarding, multi-node support, and admin controls, all from Discord.
 
 ## Requirements
