@@ -36,7 +36,7 @@ ascii_banner() {
     rainbow_line '| _ \ (_) || |   | |__ >  < (__  | _|| |) | |  | |  | | (_) | .` |'
     rainbow_line '|___/\___/ |_|   |____/_/\_\___| |___|___/___| |_| |___\___/|_|\_|'
     echo ""
-    rainbow_line '                    ~ Made by AnkitCoder ~'
+    rainbow_line '                    ~ Made by MineFlareX ~'
     echo ""
 }
 
@@ -46,7 +46,7 @@ banner() {
     echo -e "${WHT}  ─────────────────────────────────────────────────────────────${NC}"
     echo -e "  ${CYN}Fully Automated LXC/LXD VPS Discord Bot Installer${NC}"
     echo -e "  ${CYN}Ubuntu & Debian supported | Fast setup${NC}"
-    echo -e "  ${MAG}Made by AnkitCoder${NC}  |  ${BLU}github.com/AnkitKing7/Svm-v9bot${NC} (Bvm-v1 build)"
+    echo -e "  ${MAG}Made by MineFlareX${NC}  |  ${BLU}github.com/mineflarex-collab/Bvm-v1bot${NC}"
     echo -e "${WHT}  ─────────────────────────────────────────────────────────────${NC}\n"
 }
 

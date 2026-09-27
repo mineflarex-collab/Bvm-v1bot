@@ -48,7 +48,7 @@ MAIN_ADMIN_ID = int(MAIN_ADMIN_IDS_ENV[0])  # kept for backward-compat display p
 VPS_USER_ROLE_ID = int(os.getenv('VPS_USER_ROLE_ID', '1210291131301101618'))
 DEFAULT_STORAGE_POOL = os.getenv('DEFAULT_STORAGE_POOL', 'default')
 BOT_VERSION = os.getenv('BOT_VERSION', '1.0-PRO')
-BOT_DEVELOPER = os.getenv('BOT_DEVELOPER', 'AnkitCoder')
+BOT_DEVELOPER = os.getenv('BOT_DEVELOPER', 'MineFlareX')
 
 # OS Options for VPS Creation and Reinstall
 OS_OPTIONS = [
