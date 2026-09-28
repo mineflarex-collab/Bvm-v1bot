@@ -49,6 +49,7 @@ VPS_USER_ROLE_ID = int(os.getenv('VPS_USER_ROLE_ID', '1210291131301101618'))
 DEFAULT_STORAGE_POOL = os.getenv('DEFAULT_STORAGE_POOL', 'default')
 BOT_VERSION = os.getenv('BOT_VERSION', '1.0-PRO')
 BOT_DEVELOPER = os.getenv('BOT_DEVELOPER', 'MineFlareX')
+BOT_IMAGE_URL = os.getenv('BOT_IMAGE_URL', 'https://raw.githubusercontent.com/mineflarex-collab/Bvm-v1bot/main/vps.png')
 
 # OS Options for VPS Creation and Reinstall
 OS_OPTIONS = [
@@ -442,9 +443,9 @@ def create_embed(title, description="", color=0x1a1a1a):
         description=truncate_text(description, 4096),
         color=color
     )
-    embed.set_thumbnail(url="https://cdn.discordapp.com/attachments/1472508478789648446/1538220451363422208/1779656037142_0.png?ex=6a81e2ee&is=6a80916e&hm=794df5e4dfcf0189e0c5f2a23aded9b2a6cf1c13c3c28afc34fc307fe573c8b0&")
+    embed.set_thumbnail(url=BOT_IMAGE_URL)
     embed.set_footer(text=f"{BOT_NAME} VPS Manager v{BOT_VERSION} • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                     icon_url="https://cdn.discordapp.com/attachments/1472508478789648446/1538220451363422208/1779656037142_0.png?ex=6a81e2ee&is=6a80916e&hm=794df5e4dfcf0189e0c5f2a23aded9b2a6cf1c13c3c28afc34fc307fe573c8b0&")
+                     icon_url=BOT_IMAGE_URL)
     return embed
 
 def add_field(embed, name, value, inline=False):
@@ -2629,7 +2630,7 @@ async def system_status(ctx):
     
     # Footer with current time
     embed.set_footer(text=f"{BOT_NAME} System Status • Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    icon_url="https://i.imgur.com/Tv3clt0.jpeg")
+                    icon_url=BOT_IMAGE_URL)
     
     await ctx.send(embed=embed)
 

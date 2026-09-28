@@ -23,17 +23,17 @@ rainbow_line() {
 }
 
 ascii_banner() {
-    rainbow_line '######   ##     ## ##     ##    ######   ######  ########'
-    rainbow_line '##   ##  ##     ## ###   ###   ##    ## ##    ##    ##   '
-    rainbow_line '##   ##  ##     ## #### ####   ##       ##          ##   '
-    rainbow_line '######   ##     ## ## ### ##   ##       ##          ##   '
-    rainbow_line '##   ##   ##   ##  ##     ##   ##       ##          ##   '
-    rainbow_line '##   ##    ## ##   ##     ##   ##    ## ##    ##    ##   '
-    rainbow_line '######      ###    ##     ##    ######   ######     ##   '
+    rainbow_line '######   ##     ## ##     ##'
+    rainbow_line '##   ##  ##     ## ###   ###'
+    rainbow_line '##   ##  ##     ## #### ####'
+    rainbow_line '######   ##     ## ## ### ##'
+    rainbow_line '##   ##   ##   ##  ##     ##'
+    rainbow_line '##   ##    ## ##   ##     ##'
+    rainbow_line '######      ###    ##     ##'
     echo ""
-    rainbow_line '                 BVM BOT V1'
+    rainbow_line '         BVM V1'
     echo ""
-    rainbow_line '                    ~ Made by MineFlareX ~'
+    rainbow_line '  ~ Made by MineFlareX ~'
     echo ""
 }
 
