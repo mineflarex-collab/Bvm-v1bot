@@ -624,6 +624,26 @@ def generate_password(length: int = 16) -> str:
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
+def generate_container_name(user, vps_count: int) -> str:
+    """Builds the LXC container name (which is also the VPS hostname, shown as
+    root@<name>:~#) from the Discord username, e.g. 'mineflarex'.
+    First VPS gets the plain username; later/colliding ones get -2, -3, ..."""
+    raw = (getattr(user, "name", None) or "").lower()
+    base = re.sub(r'[^a-z0-9]+', '-', raw).strip('-')[:40].strip('-')
+    if not base:
+        base = f"user-{user.id}"
+    elif not base[0].isalpha():
+        base = f"vps-{base}"
+    used = {v.get('container_name') for vlist in vps_data.values() for v in vlist}
+    candidate = base
+    n = max(vps_count, 1)
+    if n > 1:
+        candidate = f"{base}-{n}"
+    while candidate in used:
+        n += 1
+        candidate = f"{base}-{n}"
+    return candidate
+
 async def setup_ssh_access(container_name: str, node_id: int) -> str:
     """Installs openssh-server, sets a random root password, and enables
     password-based root SSH login inside the container. Returns the password."""
@@ -1278,7 +1298,7 @@ class OSSelectView(discord.ui.View):
         if user_id not in vps_data:
             vps_data[user_id] = []
         vps_count = len(vps_data[user_id]) + 1
-        container_name = f"{BOT_NAME.lower()}-vps-{user_id}-{vps_count}"
+        container_name = generate_container_name(self.user, vps_count)
         ram_mb = self.ram * 1024
         try:
             await execute_lxc(container_name, f"init {os_version} {container_name} -s {DEFAULT_STORAGE_POOL}", node_id=self.node_id)
@@ -2273,34 +2293,32 @@ async def delete_vps(ctx, user: discord.Member, vps_number: int, *, reason: str 
 
     await ctx.send(embed=embed)
 
-@bot.command(name='add-resources')
-@is_admin()
-async def add_resources(ctx, vps_id: str, ram: int = None, cpu: int = None, disk: int = None):
-    if ram is None and cpu is None and disk is None:
-        await ctx.send(embed=create_error_embed("Missing Parameters", "Please specify at least one resource to add (ram, cpu, or disk)"))
+async def change_vps_resources(ctx, user, vps_number: int, ram: int, cpu: int, disk: int, mode: str):
+    """Shared logic for !add-resources (mode='add') and !resize-vps (mode='set').
+    A value of 0 means 'leave this resource unchanged'."""
+    if min(ram, cpu, disk) < 0:
+        await ctx.send(embed=create_error_embed("Invalid Values", "RAM, CPU and Disk must be 0 or positive (0 = leave unchanged)."))
         return
-    found_vps = None
-    user_id = None
-    vps_index = None
-    for uid, vps_list in vps_data.items():
-        for i, vps in enumerate(vps_list):
-            if vps['container_name'] == vps_id:
-                found_vps = vps
-                user_id = uid
-                vps_index = i
-                break
-        if found_vps:
-            break
-    if not found_vps:
-        await ctx.send(embed=create_error_embed("VPS Not Found", f"No VPS found with ID: `{vps_id}`"))
+    if ram == 0 and cpu == 0 and disk == 0:
+        await ctx.send(embed=create_error_embed("Missing Parameters", "Give at least one of RAM, CPU or Disk greater than 0."))
         return
+    user_id = str(user.id)
+    vps_list = vps_data.get(user_id, [])
+    if not vps_list:
+        await ctx.send(embed=create_error_embed("No VPS Found", f"{user.mention} doesn't have any VPS."))
+        return
+    if vps_number < 1 or vps_number > len(vps_list):
+        await ctx.send(embed=create_error_embed("VPS Not Found", f"{user.mention} has {len(vps_list)} VPS. Use a VPS number from 1 to {len(vps_list)}."))
+        return
+    vps_index = vps_number - 1
+    found_vps = vps_list[vps_index]
+    container_name = found_vps['container_name']
     node_id = found_vps['node_id']
     was_running = found_vps.get('status') == 'running' and not found_vps.get('suspended', False)
-    disk_changed = disk is not None
     if was_running:
-        await ctx.send(embed=create_info_embed("Stopping VPS", f"Stopping VPS `{vps_id}` to apply resource changes..."))
+        await ctx.send(embed=create_info_embed("Stopping VPS", f"Stopping `{container_name}` to apply resource changes..."))
         try:
-            await execute_lxc(vps_id, "stop {vps_id}", node_id=node_id)
+            await execute_lxc(container_name, f"stop {container_name}", node_id=node_id)
             found_vps['status'] = 'stopped'
             save_vps_data()
         except Exception as e:
@@ -2308,44 +2326,55 @@ async def add_resources(ctx, vps_id: str, ram: int = None, cpu: int = None, disk
             return
     changes = []
     try:
-        current_ram_gb = int(found_vps['ram'].replace('GB', ''))
-        current_cpu = int(found_vps['cpu'])
-        current_disk_gb = int(found_vps['storage'].replace('GB', ''))
-        new_ram_gb = current_ram_gb
-        new_cpu = current_cpu
-        new_disk_gb = current_disk_gb
-        if ram is not None and ram > 0:
-            new_ram_gb += ram
-            ram_mb = new_ram_gb * 1024
-            await execute_lxc(vps_id, f"config set {vps_id} limits.memory {ram_mb}MB", node_id=node_id)
-            changes.append(f"RAM: +{ram}GB (New total: {new_ram_gb}GB)")
-        if cpu is not None and cpu > 0:
-            new_cpu += cpu
-            await execute_lxc(vps_id, f"config set {vps_id} limits.cpu {new_cpu}", node_id=node_id)
-            changes.append(f"CPU: +{cpu} cores (New total: {new_cpu} cores)")
-        if disk is not None and disk > 0:
-            new_disk_gb += disk
-            await execute_lxc(vps_id, f"config device set {vps_id} root size={new_disk_gb}GB", node_id=node_id)
-            changes.append(f"Disk: +{disk}GB (New total: {new_disk_gb}GB)")
-        found_vps['ram'] = f"{new_ram_gb}GB"
+        cur_ram = int(str(found_vps['ram']).replace('GB', ''))
+        cur_cpu = int(found_vps['cpu'])
+        cur_disk = int(str(found_vps['storage']).replace('GB', ''))
+        new_ram, new_cpu, new_disk = cur_ram, cur_cpu, cur_disk
+        if ram > 0:
+            new_ram = cur_ram + ram if mode == "add" else ram
+            await execute_lxc(container_name, f"config set {container_name} limits.memory {new_ram * 1024}MB", node_id=node_id)
+            changes.append(f"RAM: {cur_ram}GB -> {new_ram}GB")
+        if cpu > 0:
+            new_cpu = cur_cpu + cpu if mode == "add" else cpu
+            await execute_lxc(container_name, f"config set {container_name} limits.cpu {new_cpu}", node_id=node_id)
+            changes.append(f"CPU: {cur_cpu} -> {new_cpu} cores")
+        if disk > 0:
+            new_disk = cur_disk + disk if mode == "add" else disk
+            await execute_lxc(container_name, f"config device set {container_name} root size={new_disk}GB", node_id=node_id)
+            changes.append(f"Disk: {cur_disk}GB -> {new_disk}GB")
+        found_vps['ram'] = f"{new_ram}GB"
         found_vps['cpu'] = str(new_cpu)
-        found_vps['storage'] = f"{new_disk_gb}GB"
-        found_vps['config'] = f"{new_ram_gb}GB RAM / {new_cpu} CPU / {new_disk_gb}GB Disk"
+        found_vps['storage'] = f"{new_disk}GB"
+        found_vps['config'] = f"{new_ram}GB RAM / {new_cpu} CPU / {new_disk}GB Disk"
         vps_data[user_id][vps_index] = found_vps
         save_vps_data()
         if was_running:
-            await execute_lxc(vps_id, f"start {vps_id}", node_id=node_id)
+            await safe_start_container(container_name, node_id)
             found_vps['status'] = 'running'
             save_vps_data()
-            await apply_internal_permissions(vps_id, node_id)
-            await recreate_port_forwards(vps_id)
-        embed = create_success_embed("Resources Added", f"Successfully added resources to VPS `{vps_id}`")
+            await apply_internal_permissions(container_name, node_id)
+            await recreate_port_forwards(container_name)
+        title = "Resources Added" if mode == "add" else "VPS Resized"
+        embed = create_success_embed(title, f"Updated VPS #{vps_number} (`{container_name}`) of {user.mention}")
         add_field(embed, "Changes Applied", "\n".join(changes), False)
-        if disk_changed:
+        if disk > 0:
             add_field(embed, "Disk Note", "Run `sudo resize2fs /` inside the VPS to expand the filesystem.", False)
         await ctx.send(embed=embed)
     except Exception as e:
-        await ctx.send(embed=create_error_embed("Resource Addition Failed", f"Error: {str(e)}"))
+        if was_running and found_vps.get('status') == 'stopped':
+            try:
+                await safe_start_container(container_name, node_id)
+                found_vps['status'] = 'running'
+                save_vps_data()
+            except Exception:
+                pass
+        await ctx.send(embed=create_error_embed("Resource Change Failed", f"Error: {str(e)}"))
+
+@bot.command(name='add-resources')
+@is_admin()
+async def add_resources(ctx, ram: int, cpu: int, disk: int, user: discord.Member, vps_number: int = 1):
+    """!add-resources <ram_gb> <cpu_cores> <disk_gb> @user [vps_number]  (0 = add nothing for that resource)"""
+    await change_vps_resources(ctx, user, vps_number, ram, cpu, disk, mode="add")
 
 
 @bot.command(name='status')
@@ -3210,74 +3239,10 @@ async def resource_monitor_control(ctx, action: str = "status"):
 
 @bot.command(name='resize-vps')
 @is_admin()
-async def resize_vps(ctx, container_name: str, ram: int = None, cpu: int = None, disk: int = None):
-    if ram is None and cpu is None and disk is None:
-        await ctx.send(embed=create_error_embed("Missing Parameters", "Please specify at least one resource to resize (ram, cpu, or disk)"))
-        return
-    found_vps = None
-    user_id = None
-    vps_index = None
-    for uid, vps_list in vps_data.items():
-        for i, vps in enumerate(vps_list):
-            if vps['container_name'] == container_name:
-                found_vps = vps
-                user_id = uid
-                vps_index = i
-                break
-        if found_vps:
-            break
-    if not found_vps:
-        await ctx.send(embed=create_error_embed("VPS Not Found", f"No VPS found with container name: `{container_name}`"))
-        return
-    node_id = found_vps['node_id']
-    was_running = found_vps.get('status') == 'running' and not found_vps.get('suspended', False)
-    disk_changed = disk is not None
-    if was_running:
-        await ctx.send(embed=create_info_embed("Stopping VPS", f"Stopping VPS `{container_name}` to apply resource changes..."))
-        try:
-            await execute_lxc(container_name, f"stop {container_name}", node_id=node_id)
-            found_vps['status'] = 'stopped'
-            save_vps_data()
-        except Exception as e:
-            await ctx.send(embed=create_error_embed("Stop Failed", f"Error stopping VPS: {str(e)}"))
-            return
-    changes = []
-    try:
-        new_ram = int(found_vps['ram'].replace('GB', ''))
-        new_cpu = int(found_vps['cpu'])
-        new_disk = int(found_vps['storage'].replace('GB', ''))
-        if ram is not None and ram > 0:
-            new_ram = ram
-            ram_mb = ram * 1024
-            await execute_lxc(container_name, f"config set {container_name} limits.memory {ram_mb}MB", node_id=node_id)
-            changes.append(f"RAM: {ram}GB")
-        if cpu is not None and cpu > 0:
-            new_cpu = cpu
-            await execute_lxc(container_name, f"config set {container_name} limits.cpu {cpu}", node_id=node_id)
-            changes.append(f"CPU: {cpu} cores")
-        if disk is not None and disk > 0:
-            new_disk = disk
-            await execute_lxc(container_name, f"config device set {container_name} root size={disk}GB", node_id=node_id)
-            changes.append(f"Disk: {disk}GB")
-        found_vps['ram'] = f"{new_ram}GB"
-        found_vps['cpu'] = str(new_cpu)
-        found_vps['storage'] = f"{new_disk}GB"
-        found_vps['config'] = f"{new_ram}GB RAM / {new_cpu} CPU / {new_disk}GB Disk"
-        vps_data[user_id][vps_index] = found_vps
-        save_vps_data()
-        if was_running:
-            await safe_start_container(container_name, node_id)
-            found_vps['status'] = 'running'
-            save_vps_data()
-            await apply_internal_permissions(container_name, node_id)
-            await recreate_port_forwards(container_name)
-        embed = create_success_embed("VPS Resized", f"Successfully resized resources for VPS `{container_name}`")
-        add_field(embed, "Changes Applied", "\n".join(changes), False)
-        if disk_changed:
-            add_field(embed, "Disk Note", "Run `sudo resize2fs /` inside the VPS to expand the filesystem.", False)
-        await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(embed=create_error_embed("Resize Failed", f"Error: {str(e)}"))
+async def resize_vps(ctx, ram: int, cpu: int, disk: int, user: discord.Member, vps_number: int = 1):
+    """!resize-vps <ram_gb> <cpu_cores> <disk_gb> @user [vps_number]  (0 = keep current value)"""
+    await change_vps_resources(ctx, user, vps_number, ram, cpu, disk, mode="set")
+
 
 @bot.command(name='clone-vps')
 @is_admin()
@@ -4258,8 +4223,8 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}lxc-list", "List all LXC containers"),
                     (f"{PREFIX}create <ram_gb> <cpu_cores> <disk_gb> @user", "Create VPS with OS selection"),
                     (f"{PREFIX}delete-vps @user <vps_number> [reason]", "Delete user's VPS"),
-                    (f"{PREFIX}add-resources <container> [ram] [cpu] [disk]", "Add resources to VPS"),
-                    (f"{PREFIX}resize-vps <container> [ram] [cpu] [disk]", "Resize VPS resources"),
+                    (f"{PREFIX}add-resources <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Add resources to VPS"),
+                    (f"{PREFIX}resize-vps <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Resize VPS resources"),
                     (f"{PREFIX}suspend-vps <container> [reason]", "Suspend VPS"),
                     (f"{PREFIX}unsuspend-vps <container>", "Unsuspend VPS"),
                     (f"{PREFIX}suspension-logs [container]", "View suspension logs"),
