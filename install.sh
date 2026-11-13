@@ -63,7 +63,84 @@ choose_os() {
     echo -e "${WHT}Select your OS:${NC}"
     echo -e "  ${YEL}1)${NC} Ubuntu"
     echo -e "  ${YEL}2)${NC} Debian"
-    read -rp "$(echo -e "${CYN}Enter choice [1-2]: ${NC}")" OS_CHOICE
+    echo -e "  ${YEL}3)${NC} Update bot ${GRN}(keeps all data, token & VPS list)${NC}"
+    read -rp "$(echo -e "${CYN}Enter choice [1-3]: ${NC}")" OS_CHOICE
+}
+
+# ---------- Update (option 3) ----------
+# Replaces only bot.py and restarts the service. vps.db, the systemd service
+# file (token / admin id) and all LXC containers are never touched.
+INSTALL_DIR="${BVM_INSTALL_DIR:-/root}"
+SERVICE_FILE="${BVM_SERVICE_FILE:-/etc/systemd/system/bot.service}"
+
+update_bot() {
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    if [ ! -f "$SERVICE_FILE" ] || [ ! -f "$INSTALL_DIR/bot.py" ]; then
+        err "No existing installation found. Run option 1 or 2 first."
+        exit 1
+    fi
+
+    # 1) Pull the latest code if this folder is a git clone (best effort)
+    if [ -d "$SCRIPT_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+        step "Fetching latest code from GitHub..."
+        if ! git -C "$SCRIPT_DIR" pull --ff-only; then
+            warn "git pull failed - continuing with the local bot.py in $SCRIPT_DIR"
+        fi
+    else
+        warn "Not a git clone - using the bot.py that is next to install.sh"
+    fi
+
+    if [ ! -f "$SCRIPT_DIR/bot.py" ]; then
+        err "bot.py not found next to install.sh."
+        exit 1
+    fi
+
+    # 2) Make sure the new file is valid Python before touching anything
+    step "Checking new bot.py for errors..."
+    if ! SYNTAX_ERR=$(python3 -c "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read())" "$SCRIPT_DIR/bot.py" 2>&1); then
+        echo "$SYNTAX_ERR" | tail -n 3
+        err "New bot.py has a syntax error. Update cancelled - your bot was NOT changed."
+        exit 1
+    fi
+
+    # 3) Back up data and the current bot.py
+    BACKUP_DIR="$INSTALL_DIR/update-backups/$(date +%Y%m%d-%H%M%S)"
+    step "Backing up data to $BACKUP_DIR ..."
+    mkdir -p "$BACKUP_DIR"
+    cp -a "$INSTALL_DIR/bot.py" "$BACKUP_DIR/bot.py"
+    for f in "$INSTALL_DIR"/vps.db "$INSTALL_DIR"/vps.db-wal "$INSTALL_DIR"/vps.db-shm; do
+        [ -f "$f" ] && cp -a "$f" "$BACKUP_DIR/"
+    done
+
+    # 4) Make sure dependencies exist (does not upgrade what is installed)
+    step "Checking Python dependencies..."
+    pip3 install -q discord.py requests 2>/dev/null || warn "Could not verify pip packages (continuing)"
+
+    # 5) Swap bot.py and restart
+    step "Installing new bot.py..."
+    cp "$SCRIPT_DIR/bot.py" "$INSTALL_DIR/bot.py"
+
+    step "Restarting bot service..."
+    systemctl daemon-reload
+    systemctl restart bot
+    sleep 6
+
+    if systemctl is-active --quiet bot; then
+        echo -e "\n${WHT}────────────────────────────────────────${NC}"
+        echo -e "${GRN}  Update complete! Bot is running.${NC}"
+        echo -e "${WHT}────────────────────────────────────────${NC}"
+        echo -e "  ${CYN}Data kept:${NC}    vps.db, token, admin ID, all VPS"
+        echo -e "  ${CYN}Backup:${NC}       $BACKUP_DIR"
+        echo -e "  ${CYN}Logs:${NC}         journalctl -u bot -f"
+        echo -e "${WHT}────────────────────────────────────────${NC}\n"
+    else
+        err "Bot failed to start with the new code - rolling back to the old version..."
+        cp -a "$BACKUP_DIR/bot.py" "$INSTALL_DIR/bot.py"
+        systemctl restart bot
+        err "Rolled back. Check the error with: journalctl -u bot -n 50 --no-pager"
+        exit 1
+    fi
 }
 
 install_lxd_ubuntu() {
@@ -197,6 +274,7 @@ main() {
     case "$OS_CHOICE" in
         1) install_lxd_ubuntu ;;
         2) install_lxd_debian ;;
+        3) update_bot; exit 0 ;;
         *) err "Invalid choice. Exiting."; exit 1 ;;
     esac
 
