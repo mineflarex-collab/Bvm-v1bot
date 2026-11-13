@@ -2378,7 +2378,7 @@ async def vps_list(ctx, node_id: int = 1):
     else:
         add_field(embed, "📋 **VPS List**", "No deployments yet. Launch one! 🚀", False)
 
-    embed.set_footer(text=f"Refresh with !vps-list {node_id} | {len(vps_info)} shown")
+    embed.set_footer(text=f"Refresh with {PREFIX}vps-list {node_id} | {len(vps_info)} shown")
     await ctx.send(embed=embed)
 
 @bot.command(name='list-all')
@@ -2617,7 +2617,7 @@ async def ports_command(ctx, subcmd: str = None, *args):
             add_field(embed, "Quota Update", f"Used: {used - 1}/{allocated}", False)
             await ctx.send(embed=embed)
         else:
-            await ctx.send(embed=create_error_embed("Not Found", "Forward ID not found or it does not belong to you. Use !ports list."))
+            await ctx.send(embed=create_error_embed("Not Found", f"Forward ID not found or it does not belong to you. Use {PREFIX}ports list."))
     else:
         await ctx.send(embed=create_error_embed("Invalid Subcommand", f"Use: add <vps_num> <port>, list, remove <id>"))
 
@@ -2626,7 +2626,7 @@ async def ports_command(ctx, subcmd: str = None, *args):
 #  !prefix  - change the bot command prefix (saved in the DB)
 # ============================================================
 @bot.command(name='prefix', aliases=['set-prefix'])
-@is_admin()
+@is_main_admin()
 async def prefix_cmd(ctx, new_prefix: str = None):
     """!prefix [new_prefix|reset]  - show / change the command prefix"""
     global PREFIX
@@ -4140,7 +4140,7 @@ async def resource_monitor_control(ctx, action: str = "status"):
     global resource_monitor_active
     if action.lower() == "status":
         status = "Active" if resource_monitor_active else "Inactive"
-        embed = create_embed("Resource Monitor Status", f"Resource monitoring is currently **{status}** (logging + sustained-usage auto-suspend, see `!auto-suspend`)", 0x00ccff if resource_monitor_active else 0xffaa00)
+        embed = create_embed("Resource Monitor Status", f"Resource monitoring is currently **{status}** (logging + sustained-usage auto-suspend, see `{PREFIX}auto-suspend`)", 0x00ccff if resource_monitor_active else 0xffaa00)
         add_field(embed, "Thresholds", f"{CPU_THRESHOLD}% CPU / {RAM_THRESHOLD}% RAM usage", True)
         add_field(embed, "Check Interval", f"60 seconds (all nodes)", True)
         await ctx.send(embed=embed)
@@ -4717,7 +4717,7 @@ async def quick_help(ctx):
             f"• `{PREFIX}serverstats` - System overview\n"
             f"• `{PREFIX}suspend-vps <container> <reason>` - Suspend VPS", False)
     
-    embed.set_footer(text=f"{BOT_NAME} VPS Manager • Use !help for complete command list")
+    embed.set_footer(text=f"{BOT_NAME} VPS Manager • Use {PREFIX}help for complete command list")
     await ctx.send(embed=embed)
 
 @bot.command(name='help-search')
@@ -4772,7 +4772,7 @@ async def help_search(ctx, *, search_term: str = None):
     if len(matches) > 15:
         add_field(embed, "Note", f"Showing 15 of {len(matches)} matches. Try a more specific search.", False)
     
-    embed.set_footer(text=f"{BOT_NAME} VPS Manager • Use !help for complete list")
+    embed.set_footer(text=f"{BOT_NAME} VPS Manager • Use {PREFIX}help for complete list")
     await ctx.send(embed=embed)    
 
 @bot.command(name='node')
@@ -5184,7 +5184,6 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}delete-vps @user <vps_number> [reason]", "Delete user's VPS"),
                     (f"{PREFIX}transfer-vps <container> @new_owner [keep-shares] [keep-password]", "Transfer a VPS to another user (data is kept)"),
                     (f"{PREFIX}fix-vps <container|all>", "Fix Docker/Pterodactyl/Tailscale + SSH password login on a VPS"),
-                    (f"{PREFIX}prefix [new|reset]", "Show / change the bot command prefix"),
                     (f"{PREFIX}add-resources <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Add resources to VPS"),
                     (f"{PREFIX}resize-vps <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Resize VPS resources"),
                     (f"{PREFIX}suspend-vps <container> [reason]", "Suspend VPS"),
@@ -5223,7 +5222,8 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}admin-remove @user", "Remove admin (mention)"),
                     (f"{PREFIX}add-admin <user_id>", "Add main admin (by ID)"),
                     (f"{PREFIX}rm-admin <user_id>", "Remove main admin (by ID)"),
-                    (f"{PREFIX}admin-list", "List admins")
+                    (f"{PREFIX}admin-list", "List admins"),
+                    (f"{PREFIX}prefix [new|reset]", "Show / change the bot command prefix")
                 ],
                 "admin_only": True,
                 "main_admin_only": True

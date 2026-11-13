@@ -123,7 +123,7 @@ Safety net: if more than 3 VPS trigger in the same check, nobody is suspended an
 
 ## Custom Prefix
 
-`!prefix` shows the current prefix. `!prefix 1` changes it (then use `1help`, `1myvps`...). `!prefix reset` goes back to the default from `bot.service`. Saved in the database, so it survives restarts. If you forget it, mention the bot: `@Bot prefix reset`. Admin only, 1-5 characters.
+`!prefix` shows the current prefix. `!prefix 1` changes it (then use `1help`, `1myvps`...). `!prefix reset` goes back to the default from `bot.service`. Saved in the database, so it survives restarts. If you forget it, mention the bot: `@Bot prefix reset`. Main Admin only (also works as `!set-prefix`), 1-5 characters.
 
 ## Automatic setup of every VPS (LXC, not Docker)
 
