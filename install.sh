@@ -118,6 +118,7 @@ update_bot() {
     pip3 install -q discord.py requests 2>/dev/null || warn "Could not verify pip packages (continuing)"
 
     # 5) Swap bot.py and restart
+    prepare_host_modules 2>/dev/null || true
     step "Installing new bot.py..."
     cp "$SCRIPT_DIR/bot.py" "$INSTALL_DIR/bot.py"
 
@@ -266,6 +267,16 @@ final_message() {
     echo -e "${WHT}────────────────────────────────────────${NC}\n"
 }
 
+# ---------- Host kernel modules (Docker / Pterodactyl / Tailscale inside VPS) ----------
+prepare_host_modules() {
+    step "Loading kernel modules (tun, overlay, br_netfilter)..."
+    for m in tun overlay br_netfilter; do modprobe "$m" 2>/dev/null || warn "Could not load module $m (may be built in)"; done
+    printf 'tun\noverlay\nbr_netfilter\n' > /etc/modules-load.d/bvm.conf
+    if [ ! -c /dev/net/tun ]; then
+        mkdir -p /dev/net && mknod /dev/net/tun c 10 200 2>/dev/null && chmod 666 /dev/net/tun || true
+    fi
+}
+
 main() {
     banner
     need_root
@@ -278,6 +289,7 @@ main() {
         *) err "Invalid choice. Exiting."; exit 1 ;;
     esac
 
+    prepare_host_modules
     install_python_stack
     deploy_bot
     configure_env

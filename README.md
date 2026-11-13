@@ -121,6 +121,24 @@ A running VPS that stays above the **CPU or RAM limit (default 90%) for 5 minute
 
 Safety net: if more than 3 VPS trigger in the same check, nobody is suspended and the admins get a warning (that is almost always a measuring problem, not mining). Unsuspend with `!unsuspend-vps <container>`.
 
+## Custom Prefix
+
+`!prefix` shows the current prefix. `!prefix 1` changes it (then use `1help`, `1myvps`...). `!prefix reset` goes back to the default from `bot.service`. Saved in the database, so it survives restarts. If you forget it, mention the bot: `@Bot prefix reset`. Admin only, 1-5 characters.
+
+## Automatic setup of every VPS (LXC, not Docker)
+
+Every new VPS is a full LXC container and gets all of this **automatically while it is created** (also after an OS reinstall, migrate and clone): nesting/privileged mode, `/dev/net/tun` (Tailscale/VPN), `/dev/fuse`, **`/dev/kvm` + `/dev/vhost-net` when the host supports KVM** (nested virtualization, QEMU, emulators; on hosts without KVM the VPS simply starts without it), a higher open-files limit, and working **root password SSH login** (sshd installed, drop-ins fixed, root unlocked).
+
+**Existing VPS are upgraded automatically too.** After the bot starts (and every 20 minutes) it goes through every VPS that is not upgraded yet and applies: `/dev/net/tun`, `/dev/kvm`, limits, SSH password-login fix (sshd config, root unlocked) and a `tailscaled` restart if Tailscale runs in userspace mode. Running VPS are not restarted, **root passwords and data are never changed**. Stopped VPS are retried automatically once they run. `!fix-vps all` does the same right now for every VPS; `!fix-vps <container>` repairs one VPS (and also re-applies its saved root password). To use KVM the host itself needs it (`ls /dev/kvm` on the host; on a cloud VPS the provider must allow nested virtualization).
+
+## Docker / Pterodactyl / Tailscale inside a VPS
+
+New VPS now get a `/dev/net/tun` device (Tailscale/VPN), a higher open-files limit and every LXC setting is applied separately (one unsupported option no longer skips the rest). The installer/updater also loads `tun`, `overlay` and `br_netfilter` on the host.
+
+**Tailscale + SSH password login not working?** Run `!fix-vps <container>` (VPS must be running). It forces `PermitRootLogin yes` / `PasswordAuthentication yes` (also in `/etc/ssh/sshd_config.d/*.conf`, which cloud images use to disable passwords), installs openssh-server if missing, unlocks root, re-applies the saved root password, restarts sshd, and restarts `tailscaled` so it uses the `/dev/net/tun` device (without it Tailscale runs in userspace mode and incoming SSH over the Tailscale IP does not work). The result shows whether sshd listens on port 22 and whether Tailscale is in kernel mode.
+
+For VPS created before this update run `!fix-vps <container>` (or `!fix-vps all`). It adds the missing settings without touching data or restarting the VPS, and shows a check of Tailscale and Docker (storage driver). Tailscale: `curl -fsSL https://tailscale.com/install.sh | sh && tailscale up`.
+
 ## VPS Transfer
 
 Moves a VPS from one user to another **without touching the VPS data**: the container is not stopped, copied, renamed or deleted - only ownership records change (in a single all-or-nothing database transaction).

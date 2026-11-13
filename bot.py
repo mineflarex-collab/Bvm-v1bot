@@ -24,6 +24,7 @@ import glob
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', '')
 BOT_NAME = os.getenv('BOT_NAME', 'Bvm-v1')
 PREFIX = os.getenv('PREFIX', '!')
+ENV_PREFIX = PREFIX   # default from the service file (used by `prefix reset`)
 YOUR_SERVER_IP = os.getenv('YOUR_SERVER_IP', '127.0.0.1')
 
 # ---- Public IP detection (used for SSH login info shown to users) ----
@@ -440,6 +441,7 @@ def find_node_id_for_container(container_name: str) -> int:
 
 # Initialize database
 init_db()
+PREFIX = get_setting('prefix', PREFIX) or PREFIX   # prefix chosen with the prefix command (saved in the DB)
 
 # Load data at startup
 vps_data = get_vps_data()
@@ -454,7 +456,11 @@ RAM_THRESHOLD = int(get_setting('ram_threshold', 90))
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+def _prefix_callable(bot_, message):
+    # reads the global every message, so a prefix change works instantly; @mention always works too
+    return commands.when_mentioned_or(PREFIX)(bot_, message)
+
+bot = commands.Bot(command_prefix=_prefix_callable, intents=intents, help_command=None)
 BOT_START_TIME = time.time()  # used by the Uptime button
 
 # Resource monitoring settings (logging only)
@@ -603,35 +609,67 @@ async def safe_start_container(container_name: str, node_id: int):
         else:
             raise
 
+def ensure_host_tun():
+    """Makes sure the host (local node) has the tun module + /dev/net/tun, which Tailscale/VPN inside a VPS needs.
+    Best effort - never raises."""
+    try:
+        subprocess.run("modprobe tun 2>/dev/null; modprobe overlay 2>/dev/null; modprobe br_netfilter 2>/dev/null; "
+                       "modprobe kvm 2>/dev/null; modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null; modprobe vhost_net 2>/dev/null; "
+                       "[ -c /dev/net/tun ] || (mkdir -p /dev/net && mknod /dev/net/tun c 10 200 && chmod 666 /dev/net/tun)",
+                       shell=True, timeout=20, capture_output=True)
+    except Exception as e:
+        logger.warning(f"ensure_host_tun failed: {e}")
+
 # Apply LXC config
 async def apply_lxc_config(container_name: str, node_id: int):
-    try:
-        await execute_lxc(container_name, f"config set {container_name} security.nesting true", node_id=node_id)
-        await execute_lxc(container_name, f"config set {container_name} security.privileged true", node_id=node_id)
-        await execute_lxc(container_name, f"config set {container_name} security.syscalls.intercept.mknod true", node_id=node_id)
-        await execute_lxc(container_name, f"config set {container_name} security.syscalls.intercept.setxattr true", node_id=node_id)
-        await execute_lxc(container_name, f"config set {container_name} linux.kernel_modules overlay,loop,nf_nat,ip_tables,ip6_tables,netlink_diag,br_netfilter", node_id=node_id)
+    """Applies the Docker / Pterodactyl / Tailscale friendly LXC settings.
+    Every setting is applied on its own: one unsupported option no longer stops the rest."""
+    node = get_node(node_id)
+    if node and node.get('is_local'):
+        await asyncio.to_thread(ensure_host_tun)
+
+    async def _run(cmd: str) -> bool:
         try:
-            await execute_lxc(container_name, f"config device add {container_name} fuse unix-char path=/dev/fuse", node_id=node_id)
-        except:
-            pass
-        raw_lxc_config = (
-            "lxc.apparmor.profile = unconfined\n"
-            "lxc.apparmor.allow_nesting = 1\n"
-            "lxc.apparmor.allow_incomplete = 1\n"
-            "\n"
-            "lxc.cap.drop =\n"
-            "lxc.cgroup.devices.allow = a\n"
-            "lxc.cgroup2.devices.allow = a\n"
-            "\n"
-            "lxc.mount.auto = proc:rw sys:rw cgroup:rw shmounts:rw\n"
-            "\n"
-            "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n"
-        )
-        await execute_lxc(container_name, f"config set {container_name} raw.lxc '{raw_lxc_config}'", node_id=node_id)
-        logger.info(f"LXC permissions applied to {container_name} on node {node_id}")
-    except Exception as e:
-        logger.error(f"Failed to apply LXC config to {container_name}: {e}")
+            await execute_lxc(container_name, cmd, node_id=node_id)
+            return True
+        except Exception as e:
+            logger.warning(f"LXC config step failed for {container_name}: {cmd[:90]} -> {str(e)[:160]}")
+            return False
+
+    results = []
+    for key, value in (
+        ("security.nesting", "true"),
+        ("security.privileged", "true"),
+        ("security.syscalls.intercept.mknod", "true"),
+        ("security.syscalls.intercept.setxattr", "true"),
+        ("linux.kernel_modules", "overlay,loop,nf_nat,ip_tables,ip6_tables,netlink_diag,br_netfilter"),
+        ("limits.kernel.nofile", "1048576"),   # Docker / Wings open many files
+    ):
+        results.append(await _run(f"config set {container_name} {key} {value}"))
+
+    # Devices (ignored if they already exist). required=false: the VPS still starts if the host lacks the device.
+    await _run(f"config device add {container_name} fuse unix-char path=/dev/fuse")
+    await _run(f"config device add {container_name} tun unix-char source=/dev/net/tun path=/dev/net/tun mode=0666 required=false")
+    # KVM: given to the VPS whenever the host has /dev/kvm (required=false: the VPS still starts on hosts without KVM)
+    await _run(f"config device add {container_name} kvm unix-char source=/dev/kvm path=/dev/kvm mode=0666 required=false")
+    await _run(f"config device add {container_name} vhost-net unix-char source=/dev/vhost-net path=/dev/vhost-net mode=0666 required=false")
+
+    raw_lxc_config = (
+        "lxc.apparmor.profile = unconfined\n"
+        "lxc.apparmor.allow_nesting = 1\n"
+        "lxc.apparmor.allow_incomplete = 1\n"
+        "\n"
+        "lxc.cap.drop =\n"
+        "lxc.cgroup.devices.allow = a\n"
+        "lxc.cgroup2.devices.allow = a\n"
+        "\n"
+        "lxc.mount.auto = proc:rw sys:rw cgroup:rw shmounts:rw\n"
+        "\n"
+        "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n"
+    )
+    await _run(f"config set {container_name} raw.lxc '{raw_lxc_config}'")
+    logger.info(f"LXC permissions applied to {container_name} on node {node_id}")
+    return any(results)
 
 # Apply internal permissions
 async def apply_internal_permissions(container_name: str, node_id: int):
@@ -710,6 +748,11 @@ async def setup_ssh_access(container_name: str, node_id: int) -> str:
             await execute_lxc(container_name, f"exec {container_name} -- bash -c \"{cmd}\"", node_id=node_id, timeout=180)
         except Exception as cmd_error:
             logger.warning(f"SSH setup command failed in {container_name}: {cmd} - {cmd_error}")
+    # Make sure password login really works (also over Tailscale): fixes sshd_config.d drop-ins, unlocks root, restarts sshd
+    try:
+        await ensure_ssh_password_login(container_name, node_id, password)
+    except Exception as e:
+        logger.warning(f"ensure_ssh_password_login failed for {container_name}: {e}")
     return password
 
 # ---------------------------------------------------------------------------
@@ -1320,12 +1363,14 @@ DEFAULT_STORAGE_POOL = os.getenv('DEFAULT_STORAGE_POOL', get_default_storage_poo
 @bot.event
 async def on_ready():
     global MAIN_LOOP
-    global _expiry_task, _guard_task
+    global _expiry_task, _guard_task, _features_task
     MAIN_LOOP = asyncio.get_running_loop()
     if _expiry_task is None or _expiry_task.done():
         _expiry_task = asyncio.create_task(expiry_loop())   # VPS expiry reminders + suspend
     if _guard_task is None or _guard_task.done():
         _guard_task = asyncio.create_task(usage_guard_loop())   # high-usage / mining auto-suspend
+    if _features_task is None or _features_task.done():
+        _features_task = asyncio.create_task(vps_feature_upgrade_loop())   # tun/kvm/SSH fix for older VPS
     logger.info(f'{bot.user} has connected to Discord!')
     await refresh_presence()
     logger.info(f"{BOT_NAME} Bot is ready!")
@@ -1335,7 +1380,7 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(embed=create_error_embed("Missing Argument", "Please check command usage with `!help`."))
+        await ctx.send(embed=create_error_embed("Missing Argument", f"Please check command usage with `{PREFIX}help`."))
     elif isinstance(error, commands.BadArgument):
         await ctx.send(embed=create_error_embed("Invalid Argument", "Please check your input and try again."))
     elif isinstance(error, commands.CheckFailure):
@@ -2575,6 +2620,230 @@ async def ports_command(ctx, subcmd: str = None, *args):
             await ctx.send(embed=create_error_embed("Not Found", "Forward ID not found or it does not belong to you. Use !ports list."))
     else:
         await ctx.send(embed=create_error_embed("Invalid Subcommand", f"Use: add <vps_num> <port>, list, remove <id>"))
+
+
+# ============================================================
+#  !prefix  - change the bot command prefix (saved in the DB)
+# ============================================================
+@bot.command(name='prefix', aliases=['set-prefix'])
+@is_admin()
+async def prefix_cmd(ctx, new_prefix: str = None):
+    """!prefix [new_prefix|reset]  - show / change the command prefix"""
+    global PREFIX
+    if new_prefix is None:
+        e = create_info_embed("Command Prefix", f"Current prefix: `{PREFIX}`\nChange it: `{PREFIX}prefix <new>` (example: `{PREFIX}prefix 1` then use `1help`)\nBack to default (`{ENV_PREFIX}`): `{PREFIX}prefix reset`")
+        add_field(e, "Forgot the prefix?", f"Mention the bot: {bot.user.mention} `prefix reset`", False)
+        await ctx.send(embed=e)
+        return
+    new = ENV_PREFIX if new_prefix.lower() in ('reset', 'default') else new_prefix
+    if len(new) > 5 or any(ch.isspace() for ch in new) or any(ch in new for ch in '`@#<>*_~|\\'):
+        await ctx.send(embed=create_error_embed("Invalid Prefix", "Use 1-5 characters with no spaces, and avoid the characters @ # < > * _ ~ | and backslash/backtick.\nExamples: `1`, `?`, `$`, `bvm.`"))
+        return
+    if new == PREFIX:
+        await ctx.send(embed=create_info_embed("No Change", f"The prefix is already `{PREFIX}`."))
+        return
+    old = PREFIX
+    set_setting('prefix', new)
+    PREFIX = new
+    log_audit(ctx.author.id, str(ctx.author), "prefix-change", "", f"{old} -> {new}")
+    e = create_success_embed("Prefix Changed", f"The prefix is now `{new}` (was `{old}`).\nExample: `{new}help`")
+    add_field(e, "Forgot it?", f"Mention the bot: {bot.user.mention} `prefix reset`", False)
+    await ctx.send(embed=e)
+
+# ============================================================
+#  !fix-vps  - re-apply Docker / Pterodactyl / Tailscale settings to existing VPS
+# ============================================================
+_features_task = None
+
+async def upgrade_vps_features(v: Dict[str, Any], do_cfg: bool = True) -> Dict[str, bool]:
+    """Brings ONE existing VPS up to date: tun/KVM/limits (LXC config, live), SSH password login (sshd fix, root unlock)
+    and a tailscaled restart if Tailscale runs in userspace mode. The root password and all data are NOT touched."""
+    name = v['container_name']
+    node = v.get('node_id', 1)
+    res = {"cfg": False, "running": False, "ssh": False}
+    if do_cfg:
+        res["cfg"] = bool(await apply_lxc_config(name, node))
+    ok, _ = await _lxc_sh(name, node, "echo up", timeout=20)
+    res["running"] = ok
+    if ok and not v.get('suspended'):
+        ssh = await ensure_ssh_password_login(name, node, None)
+        res["ssh"] = bool(ssh["listening"])
+        await _lxc_sh(name, node, "command -v tailscale >/dev/null 2>&1 && [ -c /dev/net/tun ] && { ip link show tailscale0 >/dev/null 2>&1 || systemctl restart tailscaled; }; true", timeout=60)
+    return res
+
+async def vps_feature_upgrade_loop():
+    """Runs for the whole life of the bot. Every cycle it upgrades each VPS that is not upgraded yet.
+    Stopped VPS are retried in the next cycle (SSH needs a running VPS), so every VPS is covered sooner or later."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            try:
+                state = json.loads(get_setting('features_v4', '{}'))
+            except Exception:
+                state = {}
+            try:
+                old_cfg = set(json.loads(get_setting('features_v3_done', '[]')))
+            except Exception:
+                old_cfg = set()
+            todo = 0
+            for vl in list(vps_data.values()):
+                for v in list(vl):
+                    name = v.get('container_name')
+                    st = state.get(name) or {"cfg": name in old_cfg, "ssh": False, "tries": 0}
+                    state[name] = st
+                    if st["cfg"] and st["ssh"]:
+                        continue
+                    todo += 1
+                    try:
+                        res = await upgrade_vps_features(v, do_cfg=not st["cfg"])
+                        st["cfg"] = st["cfg"] or res["cfg"]
+                        if res["running"] and not v.get('suspended'):
+                            st["tries"] = st.get("tries", 0) + 1
+                            if res["ssh"] or st["tries"] >= 3:
+                                st["ssh"] = True
+                    except Exception as e:
+                        logger.warning(f"Feature upgrade failed for {name}: {e}")
+                    set_setting('features_v4', json.dumps(state))
+                    await asyncio.sleep(3)
+            if todo:
+                logger.info(f"VPS feature upgrade cycle finished ({todo} VPS processed)")
+        except Exception as e:
+            logger.error(f"vps_feature_upgrade_loop error: {e}")
+        await asyncio.sleep(1200)   # 20 minutes
+
+async def _lxc_sh(container_name: str, node_id: int, cmd: str, timeout: int = 60):
+    """Runs a shell command inside a container. Returns (ok, output)."""
+    try:
+        out = await execute_lxc(container_name, f'exec {container_name} -- bash -c "{cmd}"', node_id=node_id, timeout=timeout)
+        return True, (out if isinstance(out, str) else "").strip()
+    except Exception as e:
+        return False, str(e)[:200]
+
+async def ensure_ssh_password_login(container_name: str, node_id: int, root_password: Optional[str] = None) -> Dict[str, Any]:
+    """Makes sure root can log in over SSH with a password - also through the Tailscale IP.
+    Installs openssh-server if missing, forces PermitRootLogin/PasswordAuthentication = yes (main file AND
+    /etc/ssh/sshd_config.d drop-ins, which cloud images use to turn passwords off), unlocks root, re-sets the
+    saved root password and restarts sshd. Never touches user data."""
+    steps = [
+        "command -v sshd >/dev/null 2>&1 || (DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server)",
+        "mkdir -p /run/sshd /etc/ssh/sshd_config.d",
+        "sed -i -E 's/^[[:space:]]*(PasswordAuthentication|PermitRootLogin|KbdInteractiveAuthentication)[[:space:]]+(no|prohibit-password|without-password)/\\1 yes/' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true",
+        "sed -i -E '/^[[:space:]]*#?[[:space:]]*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|UsePAM)[[:space:]]/d' /etc/ssh/sshd_config",
+        "printf 'PermitRootLogin yes\\nPasswordAuthentication yes\\nKbdInteractiveAuthentication yes\\nUsePAM yes\\n\\n' | cat - /etc/ssh/sshd_config > /tmp/sshd_config.new && mv /tmp/sshd_config.new /etc/ssh/sshd_config",
+        "passwd -u root >/dev/null 2>&1 || true",
+    ]
+    if root_password:
+        steps.append(f"echo 'root:{root_password}' | chpasswd")
+    errors = []
+    for cmd in steps:
+        ok, out = await _lxc_sh(container_name, node_id, cmd, timeout=240)
+        if not ok:
+            errors.append(out[:120])
+    ok, out = await _lxc_sh(container_name, node_id, "sshd -t 2>&1 && echo syntax-ok")
+    syntax_ok = ok and "syntax-ok" in out
+    if not syntax_ok:
+        errors.append(f"sshd config test failed: {out[:120]}")
+    await _lxc_sh(container_name, node_id,
+                  "systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true; "
+                  "systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || /usr/sbin/sshd 2>/dev/null || true")
+    await asyncio.sleep(2)
+    ok, listening = await _lxc_sh(container_name, node_id, "ss -ltn 2>/dev/null | grep -c ':22 ' || true")
+    ok2, eff = await _lxc_sh(container_name, node_id, "sshd -T 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication) ' | tr '\\n' ' '")
+    return {"listening": listening.strip() not in ("", "0"), "effective": eff.strip(), "errors": errors}
+
+async def _vps_feature_report(container_name: str, node_id: int) -> Dict[str, Any]:
+    """Looks inside a RUNNING container (read-only checks)."""
+    async def sh(cmd):
+        ok, out = await _lxc_sh(container_name, node_id, cmd, timeout=40)
+        return out if ok else "ERR:" + out[:80]
+    r: Dict[str, Any] = {}
+    tun = await sh("[ -c /dev/net/tun ] && echo ok || echo missing")
+    r['running'] = not tun.startswith("ERR:")
+    r['tun_ok'] = (tun == "ok")
+    r['tun'] = "✅ /dev/net/tun present" if tun == "ok" else f"❌ /dev/net/tun missing ({tun[:60]}) - restart the VPS once, then run this again"
+    dk = await sh("command -v docker >/dev/null 2>&1 && (docker info --format '{{.Driver}}' 2>/dev/null || echo daemon-down) || echo none")
+    if dk == "none":
+        r['docker'] = "ℹ️ Docker not installed inside the VPS (Pterodactyl Wings needs it)"
+    elif dk == "daemon-down":
+        r['docker'] = "⚠️ Docker installed but the daemon is not running (`systemctl start docker`)"
+    elif dk == "overlay2":
+        r['docker'] = "✅ Docker works (overlay2)"
+    else:
+        r['docker'] = f"⚠️ Docker storage driver is `{dk}` (overlay2 is best; a ZFS/btrfs LXD pool can cause this)"
+    kvm = await sh("[ -c /dev/kvm ] && echo ok || echo missing")
+    r['kvm'] = ("✅ /dev/kvm available - KVM / nested virtualization (QEMU, Android emulators...) works" if kvm == "ok"
+                else "ℹ️ /dev/kvm not available (host has no KVM or it is not enabled in the BIOS / hypervisor)")
+    ts = await sh("command -v tailscale >/dev/null 2>&1 && echo installed || echo none")
+    r['ts_installed'] = (ts == "installed")
+    if ts == "installed":
+        mode = await sh("ip link show tailscale0 >/dev/null 2>&1 && echo kernel || echo userspace")
+        ip = await sh("tailscale ip -4 2>/dev/null | head -1")
+        ip = ip if ip and not ip.startswith("ERR:") else "not logged in (`tailscale up`)"
+        r['tailscale'] = (f"✅ Tailscale installed, IP: `{ip}`\n"
+                          + ("✅ kernel mode (tailscale0) - SSH to the Tailscale IP works" if mode == "kernel"
+                             else "❌ userspace mode - incoming SSH over Tailscale will NOT work. Restart tailscaled (done automatically by this command)"))
+    else:
+        r['tailscale'] = "ℹ️ Tailscale not installed yet"
+    return r
+
+@bot.command(name='fix-vps')
+@is_admin()
+async def fix_vps(ctx, container_name: str):
+    """!fix-vps <container|all>  - fix Docker/Pterodactyl/Tailscale + SSH password login (no data touched)"""
+    if container_name.lower() == 'all':
+        targets = [v for vl in vps_data.values() for v in vl]
+        await ctx.send(embed=create_info_embed("Fixing all VPS", f"Upgrading {len(targets)} VPS one by one (tun, KVM, SSH password login, Tailscale). Running VPS are not restarted. This can take a while..."))
+        cfg_ok = ssh_ok = stopped = 0
+        for v in targets:
+            try:
+                res = await upgrade_vps_features(v)
+                cfg_ok += 1 if res["cfg"] else 0
+                ssh_ok += 1 if res["ssh"] else 0
+                stopped += 0 if res["running"] else 1
+            except Exception as e:
+                logger.error(f"fix-vps all: {v['container_name']}: {e}")
+        await ctx.send(embed=create_success_embed("Done", f"VPS processed: {len(targets)}\nLXC settings (tun/KVM/limits) applied: {cfg_ok}\nSSH password login verified: {ssh_ok}\nStopped VPS: {stopped} (SSH fix is retried automatically when they run)\nRoot passwords were not changed."))
+        return
+    _, vps = find_vps_by_container(container_name)
+    if vps is None:
+        await ctx.send(embed=create_error_embed("VPS Not Found", f"No VPS named `{container_name}`. Use `{PREFIX}list-all`."))
+        return
+    node_id = vps.get('node_id', 1)
+    msg = await ctx.send(embed=create_info_embed("Fixing VPS", f"Applying settings to `{container_name}` (data is not touched, this can take about a minute)..."))
+    await apply_lxc_config(container_name, node_id)
+    report = await _vps_feature_report(container_name, node_id)
+    if not report['running']:
+        await msg.edit(embed=create_warning_embed("Settings applied", f"`{container_name}` is stopped. Start it, then run `{PREFIX}fix-vps {container_name}` again (SSH + Tailscale checks need a running VPS)."))
+        return
+    # SSH password login (works for the normal tunnel and for the Tailscale IP)
+    ssh = await ensure_ssh_password_login(container_name, node_id, vps.get('root_password') or None)
+    # Tailscale must restart once so it picks up /dev/net/tun (it falls back to userspace mode without it)
+    restarted = False
+    if report['ts_installed'] and report['tun_ok']:
+        ok, _ = await _lxc_sh(container_name, node_id, "systemctl restart tailscaled", timeout=60)
+        restarted = ok
+        if ok:
+            await asyncio.sleep(4)
+            report = await _vps_feature_report(container_name, node_id)
+    embed = create_success_embed("VPS Fixed", f"Settings applied to `{container_name}`.")
+    ssh_line = ("✅ sshd running on port 22" if ssh['listening'] else "❌ sshd is NOT listening on port 22")
+    ssh_line += f"\n`{ssh['effective'] or 'could not read sshd settings'}`"
+    if vps.get('root_password'):
+        ssh_line += "\n✅ saved root password re-applied (user `root`)"
+    else:
+        ssh_line += "\n⚠️ no saved root password - use 🔐 Change Password in the manage panel"
+    if ssh['errors']:
+        ssh_line += "\n⚠️ " + " | ".join(ssh['errors'])[:300]
+    add_field(embed, "SSH password login", ssh_line, False)
+    ts_text = f"{report['tun']}\n{report['tailscale']}"
+    if restarted:
+        ts_text += "\n🔄 tailscaled restarted"
+    if not report['ts_installed']:
+        ts_text += "\nInstall: `curl -fsSL https://tailscale.com/install.sh | sh` then `tailscale up`"
+    add_field(embed, "Tailscale", ts_text[:1000], False)
+    add_field(embed, "Pterodactyl / Docker", f"{report['docker']}\nAfter installing Docker, Wings needs the daemon running.", False)
+    add_field(embed, "KVM", report['kvm'], False)
+    await msg.edit(embed=embed)
 
 # ============================================================
 #  VPS TRANSFER  (!transfer-vps)
@@ -4415,38 +4684,38 @@ async def quick_help(ctx):
     is_admin_user = user_id in main_admin_ids or user_id in admin_data.get("admins", [])
     
     embed = create_info_embed("🚀 Quick Help Reference", 
-        "Quick reference for common tasks. Use `!help` for complete command list.")
+        f"Quick reference for common tasks. Use `{PREFIX}help` for complete command list.")
     
     # Common user tasks
     add_field(embed, "👤 For Users", 
-        "• `!myvps` - List your VPS\n"
-        "• `!manage` - Start/stop/manage VPS\n"
-        "• `!ports` - Manage port forwarding\n"
-        "• `!share-user @user 1` - Share VPS #1\n"
-        "• `!about` - Bot information", False)
+        f"• `{PREFIX}myvps` - List your VPS\n"
+        f"• `{PREFIX}manage` - Start/stop/manage VPS\n"
+        f"• `{PREFIX}ports` - Manage port forwarding\n"
+        f"• `{PREFIX}share-user @user 1` - Share VPS #1\n"
+        f"• `{PREFIX}about` - Bot information", False)
     
     # VPS management
     add_field(embed, "🖥️ VPS Control", 
-        "• In `!manage`: Click ▶ to start VPS\n"
-        "• In `!manage`: Click ⏸ to stop VPS\n"
-        "• In `!manage`: Click 🔑 for SSH access\n"
-        "• In `!manage`: Click 📊 for live stats\n"
-        "• In `!manage`: Click 🔄 to reinstall OS", False)
+        f"• In `{PREFIX}manage`: Click ▶ to start VPS\n"
+        f"• In `{PREFIX}manage`: Click ⏸ to stop VPS\n"
+        f"• In `{PREFIX}manage`: Click 🔑 for SSH access\n"
+        f"• In `{PREFIX}manage`: Click 📊 for live stats\n"
+        f"• In `{PREFIX}manage`: Click 🔄 to reinstall OS", False)
     
     # Troubleshooting
     add_field(embed, "🔧 Common Issues", 
-        "• Ports not working? Use `!repair-ports <container>` (admin)\n"
+        f"• Ports not working? Use `{PREFIX}repair-ports <container>` (admin)\n"
         "• VPS suspended? Contact admin to unsuspend\n"
         "• Need more resources? Contact admin for upgrade\n"
         "• SSH not working? Try reinstall with different OS", False)
     
     if is_admin_user:
         add_field(embed, "🛡️ Admin Quick Actions", 
-            "• `!create 2 2 20 @user` - Create 2GB/2CPU/20GB VPS\n"
-            "• `!userinfo @user` - Check user details\n"
-            "• `!node list` - List all nodes\n"
-            "• `!serverstats` - System overview\n"
-            "• `!suspend-vps <container> <reason>` - Suspend VPS", False)
+            f"• `{PREFIX}create 2 2 20 @user` - Create 2GB/2CPU/20GB VPS\n"
+            f"• `{PREFIX}userinfo @user` - Check user details\n"
+            f"• `{PREFIX}node list` - List all nodes\n"
+            f"• `{PREFIX}serverstats` - System overview\n"
+            f"• `{PREFIX}suspend-vps <container> <reason>` - Suspend VPS", False)
     
     embed.set_footer(text=f"{BOT_NAME} VPS Manager • Use !help for complete command list")
     await ctx.send(embed=embed)
@@ -4552,7 +4821,7 @@ async def node_cmd(ctx, sub: str, *args):
                 try:
                     await ctx.author.send(embed=key_embed)
                 except discord.Forbidden:
-                    await ctx.send(embed=create_warning_embed("DM Failed", "Could not DM you the API key. Enable DMs from server members, then use `!node edit` and choose 'y' to regenerate the key."))
+                    await ctx.send(embed=create_warning_embed("DM Failed", f"Could not DM you the API key. Enable DMs from server members, then use `{PREFIX}node edit` and choose 'y' to regenerate the key."))
         except sqlite3.IntegrityError:
             await ctx.send(embed=create_error_embed("Error", "Node name already exists."))
         conn.close()
@@ -4914,6 +5183,8 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}create <ram_gb> <cpu_cores> <disk_gb> @user [expiry_days]", "Create VPS with OS selection (+ optional expiry days)"),
                     (f"{PREFIX}delete-vps @user <vps_number> [reason]", "Delete user's VPS"),
                     (f"{PREFIX}transfer-vps <container> @new_owner [keep-shares] [keep-password]", "Transfer a VPS to another user (data is kept)"),
+                    (f"{PREFIX}fix-vps <container|all>", "Fix Docker/Pterodactyl/Tailscale + SSH password login on a VPS"),
+                    (f"{PREFIX}prefix [new|reset]", "Show / change the bot command prefix"),
                     (f"{PREFIX}add-resources <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Add resources to VPS"),
                     (f"{PREFIX}resize-vps <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Resize VPS resources"),
                     (f"{PREFIX}suspend-vps <container> [reason]", "Suspend VPS"),
@@ -5051,12 +5322,12 @@ class HelpView(discord.ui.View):
        
         # Add helpful tips based on category
         tips = {
-            "user": "Tip: Use `!myvps` to see all your VPS and `!manage` to control them.",
+            "user": f"Tip: Use `{PREFIX}myvps` to see all your VPS and `{PREFIX}manage` to control them.",
             "vps": "Tip: Snapshots are useful before making major changes to your VPS.",
             "ports": "Tip: Port forwards work for both TCP and UDP protocols.",
             "system": "Tip: Set thresholds to monitor resource usage across nodes.",
-            "nodes": "Tip: Use `!node list` to see all available nodes and their status.",
-            "admin": "Tip: Always check `!userinfo @user` before modifying VPS.",
+            "nodes": f"Tip: Use `{PREFIX}node list` to see all available nodes and their status.",
+            "admin": f"Tip: Always check `{PREFIX}userinfo @user` before modifying VPS.",
             "main_admin": "Tip: Be careful when adding/removing admin privileges."
         }
        
@@ -5426,7 +5697,7 @@ async def maintenance_cmd(ctx, action: str = "status", *, reason: str = "Schedul
         await refresh_presence()
         embed = create_warning_embed("🛠️ Maintenance Mode ON", f"**Reason:** {reason[:200]}")
         add_field(embed, "Disabled for users", f"`{PREFIX}manage` (all VPS buttons), `{PREFIX}manage-shared`, `{PREFIX}ports`", False)
-        add_field(embed, "Still working", "Admin commands, running VPS, `!myvps`, `!ping`, `!about`, `!help`, and the Stats / Refresh / Uptime buttons.", False)
+        add_field(embed, "Still working", f"Admin commands, running VPS, `{PREFIX}myvps`, `{PREFIX}ping`, `{PREFIX}about`, `{PREFIX}help`, and the Stats / Refresh / Uptime buttons.", False)
         await ctx.send(embed=embed)
     elif action == "off":
         set_setting('maintenance_mode', '0')
@@ -5542,7 +5813,7 @@ async def run_vps_diagnostics(uid: str, vps: Dict, deep: bool = True) -> List[tu
             cpu = float(stats.get('cpu', 0) or 0)
             ram_pct = float(stats.get('ram', {}).get('pct', 0) or 0)
             if cpu >= 90:
-                results.append(("warn", f"High CPU usage: {cpu:.1f}%", "Check running processes with `!vps-processes`."))
+                results.append(("warn", f"High CPU usage: {cpu:.1f}%", f"Check running processes with `{PREFIX}vps-processes`."))
             if ram_pct >= 90:
                 results.append(("warn", f"High RAM usage: {ram_pct:.1f}%", f"Give more RAM with `{PREFIX}add-resources`."))
             m = re.search(r'\((\d+)%\)', str(stats.get('disk', '')))
