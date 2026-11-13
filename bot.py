@@ -740,6 +740,63 @@ async def establish_pinggy_tunnel(container_name: str, node_id: int, retries: in
     logger.warning(f"Pinggy: no tunnel address found for {container_name} after {retries} attempts")
     return None
 
+# ---------------------------------------------------------------------------
+# SSHX web terminal (https://sshx.io) - gives a browser-based terminal link
+# ---------------------------------------------------------------------------
+SSHX_LOG_PATH = "/root/.sshx_session.log"
+
+def parse_sshx_link(log_text: str) -> Optional[str]:
+    """Extracts the https://sshx.io/s/<id>#<key> link from sshx output (ANSI codes ignored)."""
+    if not log_text:
+        return None
+    match = re.search(r'https://sshx\.io/s/[A-Za-z0-9_\-]+#[A-Za-z0-9_\-]+', log_text)
+    return match.group(0) if match else None
+
+async def establish_sshx_session(container_name: str, node_id: int, retries: int = 6, wait_seconds: int = 4) -> Optional[str]:
+    """Installs sshx inside the container if needed, starts it as a persistent
+    background process and returns the web terminal link (or None on failure)."""
+    try:
+        await execute_lxc(
+            container_name,
+            f"exec {container_name} -- bash -c \"command -v sshx >/dev/null || (command -v curl >/dev/null || (DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates); curl -sSf https://sshx.io/get | sh)\"",
+            node_id=node_id, timeout=240
+        )
+    except Exception as e:
+        logger.error(f"SSHX: install failed in {container_name}: {e}")
+        return None
+
+    # Stop any previous sshx session and clear the log
+    try:
+        await execute_lxc(
+            container_name,
+            f"exec {container_name} -- bash -c \"pkill -x sshx >/dev/null 2>&1; rm -f {SSHX_LOG_PATH}; true\"",
+            node_id=node_id
+        )
+    except Exception:
+        pass
+
+    try:
+        await execute_lxc(
+            container_name,
+            f"exec {container_name} -- bash -c \"setsid nohup sshx > {SSHX_LOG_PATH} 2>&1 < /dev/null & disown\"",
+            node_id=node_id
+        )
+    except Exception as e:
+        logger.error(f"SSHX: failed to start in {container_name}: {e}")
+        return None
+
+    for _ in range(retries):
+        await asyncio.sleep(wait_seconds)
+        try:
+            log_output = await execute_lxc(container_name, f"exec {container_name} -- cat {SSHX_LOG_PATH}", node_id=node_id)
+        except Exception:
+            log_output = ""
+        link = parse_sshx_link(log_output if isinstance(log_output, str) else "")
+        if link:
+            return link
+    logger.warning(f"SSHX: no link found for {container_name} after {retries} attempts")
+    return None
+
 # Get or create VPS role
 async def get_or_create_vps_role(guild):
     global VPS_USER_ROLE_ID
@@ -1355,7 +1412,7 @@ class OSSelectView(discord.ui.View):
                 add_field(dm_embed, "🔑 SSH Login", f"**Host:** `{tunnel_host}`\n**Port:** `{tunnel_port}`\n**User:** `root`\n**Password:** `{root_password}`\n\n```ssh root@{tunnel_host} -p {tunnel_port}```", False)
             else:
                 add_field(dm_embed, "🔑 Root Password", f"`{root_password}`\n⚠️ SSH tunnel setup failed — use `{PREFIX}manage` → 🔌 Reconnect Tunnel to try again.", False)
-            add_field(dm_embed, "Management", f"• Use `{PREFIX}manage` to start/stop/reinstall your VPS\n• Use `{PREFIX}manage` → SSH for terminal access\n• Contact admin for upgrades or issues", False)
+            add_field(dm_embed, "Management", f"• Use `{PREFIX}manage` to start/stop/reinstall your VPS\n• Use `{PREFIX}manage` → 🌐 SSHX for SSH login + web terminal link\n• Contact admin for upgrades or issues", False)
             add_field(dm_embed, "Important Notes", "• Full root access via SSH\n• Docker-ready with nesting and privileged mode\n• Back up your data regularly\n• Change your root password after first login", False)
             try:
                 await self.user.send(embed=dm_embed)
@@ -1539,13 +1596,13 @@ class ManageView(discord.ui.View):
         start_button.callback = lambda inter: self.action_callback(inter, 'start')
         stop_button = discord.ui.Button(label="⏸ Stop", style=discord.ButtonStyle.secondary)
         stop_button.callback = lambda inter: self.action_callback(inter, 'stop')
-        ssh_button = discord.ui.Button(label="🔑 SSH", style=discord.ButtonStyle.primary)
-        ssh_button.callback = lambda inter: self.action_callback(inter, 'tmate')
+        sshx_button = discord.ui.Button(label="🌐 SSHX", style=discord.ButtonStyle.primary)
+        sshx_button.callback = lambda inter: self.action_callback(inter, 'sshx')
         stats_button = discord.ui.Button(label="📊 Stats", style=discord.ButtonStyle.secondary)
         stats_button.callback = lambda inter: self.action_callback(inter, 'stats')
         self.add_item(start_button)
         self.add_item(stop_button)
-        self.add_item(ssh_button)
+        self.add_item(sshx_button)
         self.add_item(stats_button)
         if not self.is_shared:
             addport_button = discord.ui.Button(label="➕ Add Port", style=discord.ButtonStyle.primary)
@@ -1698,39 +1755,42 @@ class ManageView(discord.ui.View):
                 await interaction.followup.send(embed=create_success_embed("VPS Stopped", f"VPS `{container_name}` has been stopped!"), ephemeral=True)
             except Exception as e:
                 await interaction.followup.send(embed=create_error_embed("Stop Failed", str(e)), ephemeral=True)
-        elif action == 'tmate':
+        elif action == 'sshx':
             if suspended:
                 await interaction.followup.send(embed=create_error_embed("Access Denied", "Cannot access suspended VPS."), ephemeral=True)
                 return
-            await interaction.followup.send(embed=create_info_embed("SSH Access", "Generating SSH connection..."), ephemeral=True)
+            if target_vps.get('status') != 'running':
+                await interaction.followup.send(embed=create_error_embed("VPS Not Running", "Start the VPS first, then use SSHX."), ephemeral=True)
+                return
+            await interaction.followup.send(embed=create_info_embed("🌐 SSHX", "Setting up SSHX web terminal, this can take up to 40 seconds..."), ephemeral=True)
             try:
-                # Check if tmate is installed
-                try:
-                    await execute_lxc(container_name, f"exec {container_name} -- which tmate", node_id=node_id)
-                except:
-                    await interaction.followup.send(embed=create_info_embed("Installing SSH", "Installing tmate..."), ephemeral=True)
-                    await execute_lxc(container_name, f"exec {container_name} -- apt-get update -y", node_id=node_id)
-                    await execute_lxc(container_name, f"exec {container_name} -- apt-get install tmate -y", node_id=node_id)
-                    await interaction.followup.send(embed=create_success_embed("Installed", "SSH service installed!"), ephemeral=True)
-                session_name = f"{BOT_NAME.lower()}-session-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                await execute_lxc(container_name, f"exec {container_name} -- tmate -S /tmp/{session_name}.sock new-session -d", node_id=node_id)
-                await asyncio.sleep(3)
-                ssh_output = await execute_lxc(container_name, f"exec {container_name} -- tmate -S /tmp/{session_name}.sock display -p '#{{tmate_ssh}}'", node_id=node_id)
-                ssh_url = ssh_output.strip()
-                if ssh_url:
-                    try:
-                        ssh_embed = create_embed("🔑 SSH Access", f"SSH connection for VPS `{container_name}`:", 0x00ff88)
-                        add_field(ssh_embed, "Command", f"```{ssh_url}```", False)
-                        add_field(ssh_embed, "⚠️ Security", "This link is temporary. Do not share it.", False)
-                        add_field(ssh_embed, "📝 Session", f"Session ID: {session_name}", False)
-                        await interaction.user.send(embed=ssh_embed)
-                        await interaction.followup.send(embed=create_success_embed("SSH Sent", f"Check your DMs for SSH link! Session: {session_name}"), ephemeral=True)
-                    except discord.Forbidden:
-                        await interaction.followup.send(embed=create_error_embed("DM Failed", "Enable DMs to receive SSH link!"), ephemeral=True)
+                sshx_link = await establish_sshx_session(container_name, node_id)
+                pinggy_address = target_vps.get('pinggy_address')
+                if not sshx_link and not pinggy_address:
+                    await interaction.followup.send(embed=create_error_embed("SSHX Failed", "Could not create an SSHX link and there is no SSH tunnel. Make sure the VPS is running and try again."), ephemeral=True)
+                    return
+                dm_embed = create_success_embed("🌐 SSH + SSHX Access", f"Access details for VPS `{container_name}`")
+                if pinggy_address:
+                    tunnel_host, tunnel_port = pinggy_address.split(":")
+                    ssh_text = f"**Host:** `{tunnel_host}`\n**Port:** `{tunnel_port}`\n**User:** `root`\n"
+                    if not self.is_shared and target_vps.get('root_password'):
+                        ssh_text += f"**Password:** `{target_vps['root_password']}`\n"
+                    ssh_text += f"\n```ssh root@{tunnel_host} -p {tunnel_port}```"
+                    add_field(dm_embed, "🔑 SSH Login", ssh_text, False)
                 else:
-                    await interaction.followup.send(embed=create_error_embed("SSH Failed", "No SSH URL generated."), ephemeral=True)
+                    add_field(dm_embed, "🔑 SSH Login", f"No active SSH tunnel. Use 🔌 Reconnect Tunnel to create one.", False)
+                if sshx_link:
+                    add_field(dm_embed, "🌐 SSHX Web Terminal", f"Open in your browser:\n{sshx_link}", False)
+                else:
+                    add_field(dm_embed, "🌐 SSHX Web Terminal", "Could not generate the SSHX link right now. Press 🌐 SSHX again.", False)
+                add_field(dm_embed, "⚠️ Security", "These details are private. Do not share them.", False)
+                try:
+                    await interaction.user.send(embed=dm_embed)
+                    await interaction.followup.send(embed=create_success_embed("SSHX Ready", "Check your DMs for the SSH login and SSHX link!"), ephemeral=True)
+                except discord.Forbidden:
+                    await interaction.followup.send(embed=dm_embed, ephemeral=True)
             except Exception as e:
-                await interaction.followup.send(embed=create_error_embed("SSH Error", str(e)), ephemeral=True)
+                await interaction.followup.send(embed=create_error_embed("SSHX Error", str(e)), ephemeral=True)
         elif action == 'changepass':
             try:
                 new_password = generate_password()
