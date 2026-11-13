@@ -141,6 +141,25 @@ def container_stats(name):
     return stats
 
 
+def prepare_host():
+    """Loads the kernel modules and creates the device nodes Docker / Pterodactyl Wings / snap / Tailscale / KVM
+    inside a VPS need. Needs root; best effort, never fails."""
+    if os.geteuid() != 0:
+        print("NOTE: not running as root - kernel modules / devices were not prepared.")
+        return
+    mods = ["tun", "overlay", "br_netfilter", "bridge", "veth", "loop", "squashfs", "fuse", "ip_tables", "ip6_tables",
+            "iptable_nat", "iptable_filter", "iptable_mangle", "nf_nat", "nf_conntrack", "xt_conntrack", "xt_MASQUERADE",
+            "xt_addrtype", "xt_mark", "nfnetlink", "vxlan", "netlink_diag", "vhost_net", "kvm", "kvm_intel", "kvm_amd"]
+    for m in mods:
+        run(["modprobe", m], 10)
+    script = ("[ -c /dev/net/tun ] || (mkdir -p /dev/net && mknod /dev/net/tun c 10 200 && chmod 666 /dev/net/tun); "
+              "[ -c /dev/fuse ] || (mknod /dev/fuse c 10 229 && chmod 666 /dev/fuse); "
+              "[ -c /dev/loop-control ] || mknod /dev/loop-control c 10 237; "
+              "for i in 0 1 2 3 4 5 6 7; do [ -b /dev/loop$i ] || mknod /dev/loop$i b 7 $i; done; true")
+    run(["sh", "-c", script], 30)
+    print("Host prepared (kernel modules + tun/fuse/loop devices).")
+
+
 # ---------------------------------------------------------------- server
 class Handler(BaseHTTPRequestHandler):
     server_version = "BVMNodeAgent/1.0"
@@ -230,6 +249,7 @@ def main():
     if shutil.which("lxc") is None:
         print("WARNING: `lxc` was not found on this server. Install LXD first.")
     API_KEY = args.api_key
+    prepare_host()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"BVM Node Agent listening on {args.host}:{args.port}")
     try:

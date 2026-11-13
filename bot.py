@@ -150,7 +150,7 @@ def init_db():
         ('ram_threshold', '90'),
         ('default_expiry_days', '0'),     # 0 = new VPS never expire
         ('expiry_reminders', '1'),
-        ('auto_suspend', '1'),            # usage guard (mining / abuse)
+        ('auto_suspend', '0'),            # usage guard (mining / abuse) - OFF by default, the usage alert only sends a DM
         ('auto_suspend_minutes', '5'),
     ]
     for key, value in settings_init:
@@ -346,24 +346,59 @@ def deallocate_ports(user_id: str, amount: int):
     conn.commit()
     conn.close()
 
-def get_available_host_port(node_id: int) -> Optional[int]:
+def _used_host_ports(node_id: int) -> set:
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT host_port FROM port_forwards WHERE vps_container IN (SELECT container_name FROM vps WHERE node_id = ?)', (node_id,))
     used_ports = set(row[0] for row in cur.fetchall())
     conn.close()
+    return used_ports
+
+def _host_port_in_use_locally(port: int) -> bool:
+    """True if something on THIS machine already listens on the port (TCP or UDP). Only meaningful for the local node."""
+    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        sock = socket.socket(socket.AF_INET, kind)
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            return True
+        finally:
+            sock.close()
+    return False
+
+def get_available_host_port(node_id: int) -> Optional[int]:
+    used_ports = _used_host_ports(node_id)
+    node = get_node(node_id)
+    is_local = bool(node and node.get('is_local'))
     for _ in range(100):
         port = random.randint(20000, 50000)
-        if port not in used_ports:
-            return port
+        if port in used_ports:
+            continue
+        if is_local and _host_port_in_use_locally(port):
+            continue
+        return port
     return None
 
-async def create_port_forward(user_id: str, container: str, vps_port: int, node_id: int) -> Optional[int]:
-    host_port = get_available_host_port(node_id)
-    if not host_port:
-        return None
+async def create_port_forward(user_id: str, container: str, vps_port: int, node_id: int, host_port: Optional[int] = None) -> Optional[int]:
+    """Forwards TCP+UDP host_port -> VPS vps_port. host_port=None picks a random free port (20000-50000).
+    A fixed host_port (e.g. the same as vps_port, which Pterodactyl Wings / game servers need) raises ValueError
+    with a readable message if it cannot be used."""
+    if host_port is None:
+        host_port = get_available_host_port(node_id)
+        if not host_port:
+            return None
+    else:
+        if host_port < 1024 or host_port > 65535:
+            raise ValueError("Host port must be between 1024 and 65535.")
+        if host_port in _used_host_ports(node_id):
+            raise ValueError(f"Host port {host_port} is already forwarded to another VPS on this node.")
+        node = get_node(node_id)
+        if node and node.get('is_local') and await asyncio.to_thread(_host_port_in_use_locally, host_port):
+            raise ValueError(f"Host port {host_port} is already used by another program on the server.")
+    tcp_added = False
     try:
         await execute_lxc(container, f"config device add {container} tcp_proxy_{host_port} proxy listen=tcp:0.0.0.0:{host_port} connect=tcp:127.0.0.1:{vps_port}", node_id=node_id)
+        tcp_added = True
         await execute_lxc(container, f"config device add {container} udp_proxy_{host_port} proxy listen=udp:0.0.0.0:{host_port} connect=udp:127.0.0.1:{vps_port}", node_id=node_id)
         conn = get_db()
         cur = conn.cursor()
@@ -374,6 +409,11 @@ async def create_port_forward(user_id: str, container: str, vps_port: int, node_
         return host_port
     except Exception as e:
         logger.error(f"Failed to create port forward: {e}")
+        if tcp_added:
+            try:
+                await execute_lxc(container, f"config device remove {container} tcp_proxy_{host_port}", node_id=node_id)
+            except Exception:
+                pass
         return None
 
 async def remove_port_forward(forward_id: int, is_admin: bool = False, requester_id: Optional[str] = None) -> tuple[bool, Optional[str]]:
@@ -609,24 +649,68 @@ async def safe_start_container(container_name: str, node_id: int):
         else:
             raise
 
+# Kernel modules that Docker / Pterodactyl Wings / snap / Tailscale / KVM inside a VPS need.
+HOST_MODULES = [
+    "tun", "overlay", "br_netfilter", "bridge", "veth", "loop", "squashfs", "fuse",
+    "ip_tables", "ip6_tables", "iptable_nat", "iptable_filter", "iptable_mangle", "ip6table_filter", "ip6table_nat",
+    "nf_nat", "nf_conntrack", "nf_conntrack_netlink", "xt_conntrack", "xt_MASQUERADE", "xt_addrtype", "xt_nat",
+    "xt_mark", "xt_comment", "xt_multiport", "xt_tcpudp", "xt_REDIRECT", "xt_owner", "nfnetlink",
+    "vxlan", "netlink_diag", "vhost_net", "kvm", "kvm_intel", "kvm_amd",
+]
+
+# Modules that are put into the LXD `linux.kernel_modules` list of a VPS. LXD REFUSES to start a container when one
+# of them cannot be loaded, so only modules the host really has are used (see _vps_kernel_modules()).
+VPS_MODULE_CANDIDATES = [
+    "overlay", "loop", "squashfs", "fuse", "br_netfilter", "veth", "bridge",
+    "nf_nat", "nf_conntrack", "ip_tables", "ip6_tables", "iptable_nat", "iptable_filter", "iptable_mangle",
+    "xt_conntrack", "xt_MASQUERADE", "xt_addrtype", "xt_mark", "nfnetlink", "vxlan", "netlink_diag",
+]
+VPS_MODULES_FALLBACK = "overlay,loop,nf_nat,ip_tables,ip6_tables,netlink_diag,br_netfilter"
+LOOP_DEVICE_COUNT = 8   # /dev/loop0..7 are given to each VPS (snap needs loop devices)
+
 def ensure_host_tun():
-    """Makes sure the host (local node) has the tun module + /dev/net/tun, which Tailscale/VPN inside a VPS needs.
+    """Prepares the host (local node) for Docker / Pterodactyl Wings / snap / Tailscale / KVM inside a VPS:
+    loads the kernel modules, makes /dev/net/tun, /dev/fuse, /dev/loop-control and the loop devices.
     Best effort - never raises."""
     try:
-        subprocess.run("modprobe tun 2>/dev/null; modprobe overlay 2>/dev/null; modprobe br_netfilter 2>/dev/null; "
-                       "modprobe kvm 2>/dev/null; modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null; modprobe vhost_net 2>/dev/null; "
-                       "[ -c /dev/net/tun ] || (mkdir -p /dev/net && mknod /dev/net/tun c 10 200 && chmod 666 /dev/net/tun)",
-                       shell=True, timeout=20, capture_output=True)
+        script = "; ".join(f"modprobe {m} 2>/dev/null" for m in HOST_MODULES) + "; "
+        script += ("[ -c /dev/net/tun ] || (mkdir -p /dev/net && mknod /dev/net/tun c 10 200 && chmod 666 /dev/net/tun); "
+                   "[ -c /dev/fuse ] || (mknod /dev/fuse c 10 229 && chmod 666 /dev/fuse); "
+                   "[ -c /dev/loop-control ] || mknod /dev/loop-control c 10 237; "
+                   f"for i in $(seq 0 {LOOP_DEVICE_COUNT - 1}); do [ -b /dev/loop$i ] || mknod /dev/loop$i b 7 $i; done; "
+                   "true")
+        subprocess.run(script, shell=True, timeout=60, capture_output=True)
     except Exception as e:
         logger.warning(f"ensure_host_tun failed: {e}")
 
+def _vps_kernel_modules() -> str:
+    """Comma separated module list for linux.kernel_modules - only modules this host can load (built in or available).
+    Falls back to a small safe list if the host cannot be inspected."""
+    ok = []
+    try:
+        for m in VPS_MODULE_CANDIDATES:
+            if os.path.isdir(f"/sys/module/{m}"):
+                ok.append(m)
+                continue
+            r = subprocess.run(["modprobe", "-n", m], capture_output=True, timeout=10)
+            if r.returncode == 0:
+                ok.append(m)
+    except Exception as e:
+        logger.warning(f"_vps_kernel_modules failed: {e}")
+    return ",".join(ok) if ok else VPS_MODULES_FALLBACK
+
 # Apply LXC config
 async def apply_lxc_config(container_name: str, node_id: int):
-    """Applies the Docker / Pterodactyl / Tailscale friendly LXC settings.
+    """Applies the Docker / Pterodactyl Wings / snap / Tailscale / KVM friendly LXC settings.
     Every setting is applied on its own: one unsupported option no longer stops the rest."""
     node = get_node(node_id)
-    if node and node.get('is_local'):
+    is_local = bool(node and node.get('is_local'))
+    if is_local:
         await asyncio.to_thread(ensure_host_tun)
+        kernel_modules = await asyncio.to_thread(_vps_kernel_modules)
+    else:
+        # A remote node cannot be inspected from here (node-agent.py loads the modules itself when it starts)
+        kernel_modules = VPS_MODULES_FALLBACK
 
     async def _run(cmd: str) -> bool:
         try:
@@ -642,17 +726,36 @@ async def apply_lxc_config(container_name: str, node_id: int):
         ("security.privileged", "true"),
         ("security.syscalls.intercept.mknod", "true"),
         ("security.syscalls.intercept.setxattr", "true"),
-        ("linux.kernel_modules", "overlay,loop,nf_nat,ip_tables,ip6_tables,netlink_diag,br_netfilter"),
+        ("linux.kernel_modules", kernel_modules),
         ("limits.kernel.nofile", "1048576"),   # Docker / Wings open many files
     ):
         results.append(await _run(f"config set {container_name} {key} {value}"))
+    if not results[4]:
+        # a module list the node refused: retry with the small safe list so the VPS keeps its other settings
+        await _run(f"config set {container_name} linux.kernel_modules {VPS_MODULES_FALLBACK}")
 
-    # Devices (ignored if they already exist). required=false: the VPS still starts if the host lacks the device.
-    await _run(f"config device add {container_name} fuse unix-char path=/dev/fuse")
-    await _run(f"config device add {container_name} tun unix-char source=/dev/net/tun path=/dev/net/tun mode=0666 required=false")
-    # KVM: given to the VPS whenever the host has /dev/kvm (required=false: the VPS still starts on hosts without KVM)
-    await _run(f"config device add {container_name} kvm unix-char source=/dev/kvm path=/dev/kvm mode=0666 required=false")
-    await _run(f"config device add {container_name} vhost-net unix-char source=/dev/vhost-net path=/dev/vhost-net mode=0666 required=false")
+    # Devices that already exist are skipped. required=false: the VPS still starts if the host lacks the device.
+    try:
+        existing_raw = await execute_lxc(container_name, f"config device list {container_name}", node_id=node_id)
+        existing = set(existing_raw.split()) if isinstance(existing_raw, str) else set()
+    except Exception:
+        existing = set()
+
+    devices = [
+        ("fuse", "unix-char path=/dev/fuse"),
+        ("tun", "unix-char source=/dev/net/tun path=/dev/net/tun mode=0666 required=false"),
+        # KVM: given whenever the host has /dev/kvm (VPS still starts on hosts without KVM)
+        ("kvm", "unix-char source=/dev/kvm path=/dev/kvm mode=0666 required=false"),
+        ("vhost-net", "unix-char source=/dev/vhost-net path=/dev/vhost-net mode=0666 required=false"),
+        # snap: snapd mounts its packages (squashfs) through loop devices
+        ("loop-control", "unix-char source=/dev/loop-control path=/dev/loop-control mode=0660 required=false"),
+    ]
+    for i in range(LOOP_DEVICE_COUNT):
+        devices.append((f"loop{i}", f"unix-block source=/dev/loop{i} path=/dev/loop{i} mode=0660 required=false"))
+    for dev_name, dev_args in devices:
+        if dev_name in existing:
+            continue
+        await _run(f"config device add {container_name} {dev_name} {dev_args}")
 
     raw_lxc_config = (
         "lxc.apparmor.profile = unconfined\n"
@@ -663,7 +766,7 @@ async def apply_lxc_config(container_name: str, node_id: int):
         "lxc.cgroup.devices.allow = a\n"
         "lxc.cgroup2.devices.allow = a\n"
         "\n"
-        "lxc.mount.auto = proc:rw sys:rw cgroup:rw shmounts:rw\n"
+        "lxc.mount.auto = proc:rw sys:rw cgroup:rw\n"
         "\n"
         "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n"
     )
@@ -681,6 +784,10 @@ async def apply_internal_permissions(container_name: str, node_id: int):
             "echo 'net.ipv4.ping_group_range=0 2147483647' >> /etc/sysctl.d/99-custom.conf",
             "echo 'fs.inotify.max_user_watches=524288' >> /etc/sysctl.d/99-custom.conf",
             "echo 'kernel.unprivileged_userns_clone=1' >> /etc/sysctl.d/99-custom.conf",
+            "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.d/99-custom.conf",
+            "echo 'net.ipv6.conf.all.forwarding=1' >> /etc/sysctl.d/99-custom.conf",
+            "echo 'vm.max_map_count=262144' >> /etc/sysctl.d/99-custom.conf",
+            "echo 'fs.inotify.max_user_instances=8192' >> /etc/sysctl.d/99-custom.conf",
             "sysctl -p /etc/sysctl.d/99-custom.conf || true"
         ]
         for cmd in commands:
@@ -1192,26 +1299,23 @@ async def get_container_status_local(container_name: str):
 
 async def get_container_cpu_pct_local(container_name: str):
     try:
+        # `top -bn2 -d1`: the FIRST iteration is the average since boot, the SECOND one is the real current load
         proc = await asyncio.create_subprocess_exec(
-            "lxc", "exec", container_name, "--", "top", "-bn1",
+            "lxc", "exec", container_name, "--", "top", "-bn2", "-d", "1",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await proc.communicate()
         output = stdout.decode()
+        idle = None
         for line in output.splitlines():
             if '%Cpu(s):' in line:
-                parts = line.split()
-                us = float(parts[1])
-                sy = float(parts[3])
-                ni = float(parts[5])
-                id_ = float(parts[7])
-                wa = float(parts[9])
-                hi = float(parts[11])
-                si = float(parts[13])
-                st = float(parts[15])
-                return us + sy + ni + wa + hi + si + st
-        return 0.0
+                m = re.search(r'([\d.,]+)\s*id', line)
+                if m:
+                    idle = float(m.group(1).replace(',', '.'))   # keep the LAST Cpu line
+        if idle is None:
+            return 0.0
+        return max(0.0, min(100.0, 100.0 - idle))
     except Exception as e:
         logger.error(f"Error getting CPU for {container_name}: {e}")
         return 0.0
@@ -1363,12 +1467,12 @@ DEFAULT_STORAGE_POOL = os.getenv('DEFAULT_STORAGE_POOL', get_default_storage_poo
 @bot.event
 async def on_ready():
     global MAIN_LOOP
-    global _expiry_task, _guard_task, _features_task
+    global _expiry_task, _guard_task, _features_task, _usage_alert_task
     MAIN_LOOP = asyncio.get_running_loop()
     if _expiry_task is None or _expiry_task.done():
         _expiry_task = asyncio.create_task(expiry_loop())   # VPS expiry reminders + suspend
-    if _guard_task is None or _guard_task.done():
-        _guard_task = asyncio.create_task(usage_guard_loop())   # high-usage / mining auto-suspend
+    if _usage_alert_task is None or _usage_alert_task.done():
+        _usage_alert_task = asyncio.create_task(vps_usage_alert_loop())   # 24/7 CPU/RAM/disk >= limit -> DM main admins
     if _features_task is None or _features_task.done():
         _features_task = asyncio.create_task(vps_feature_upgrade_loop())   # tun/kvm/SSH fix for older VPS
     logger.info(f'{bot.user} has connected to Discord!')
@@ -2554,20 +2658,39 @@ async def ports_command(ctx, subcmd: str = None, *args):
     available = allocated - used
     if subcmd is None:
         embed = create_info_embed("Port Forwarding Help", f"**Your Quota:** Allocated: {allocated}, Used: {used}, Available: {available}")
-        add_field(embed, "Commands", f"{PREFIX}ports add <vps_num> <port>\n{PREFIX}ports list\n{PREFIX}ports remove <id>", False)
+        add_field(embed, "Commands", f"{PREFIX}ports add <vps_num> <port>\n{PREFIX}ports add <vps_num> <port> same  (same port on the host - Wings/game servers)\n{PREFIX}ports add <vps_num> <port> <host_port>\n{PREFIX}ports add <vps_num> 25565-25570  (range)\n{PREFIX}ports list\n{PREFIX}ports remove <id>", False)
         await ctx.send(embed=embed)
         return
     if subcmd == 'add':
+        usage = (f"Usage:\n`{PREFIX}ports add <vps_number> <vps_port>` - random host port\n"
+                 f"`{PREFIX}ports add <vps_number> <vps_port> same` - SAME host port (Pterodactyl Wings 8080/2022, game servers)\n"
+                 f"`{PREFIX}ports add <vps_number> <vps_port> <host_port>` - choose the host port (1024-65535)\n"
+                 f"`{PREFIX}ports add <vps_number> 25565-25570` - a range, same ports on the host (1 quota slot per port, max 50)")
         if len(args) < 2:
-            await ctx.send(embed=create_error_embed("Usage", f"Usage: {PREFIX}ports add <vps_number> <vps_port>"))
+            await ctx.send(embed=create_error_embed("Usage", usage))
             return
         try:
             vps_num = int(args[0])
-            vps_port = int(args[1])
-            if vps_port < 1 or vps_port > 65535:
+            m = re.fullmatch(r'(\d+)-(\d+)', args[1])
+            if m:
+                first, last = int(m.group(1)), int(m.group(2))
+                if first > last or last - first + 1 > 50:
+                    raise ValueError
+                port_pairs = [(p_, p_) for p_ in range(first, last + 1)]   # range: always the same port on the host
+            else:
+                vps_port = int(args[1])
+                extra = args[2].lower() if len(args) > 2 else None
+                if extra is None:
+                    host_choice = None
+                elif extra in ('same', 'same-port', 'samee'):
+                    host_choice = vps_port
+                else:
+                    host_choice = int(extra)
+                port_pairs = [(vps_port, host_choice)]
+            if any(vp < 1 or vp > 65535 for vp, _ in port_pairs):
                 raise ValueError
         except ValueError:
-            await ctx.send(embed=create_error_embed("Invalid Input", "VPS number and port must be positive integers (port: 1-65535)."))
+            await ctx.send(embed=create_error_embed("Invalid Input", "VPS number and ports must be integers (port: 1-65535, range max 50 ports).\n\n" + usage))
             return
         vps_list = vps_data.get(user_id, [])
         if vps_num < 1 or vps_num > len(vps_list):
@@ -2576,17 +2699,30 @@ async def ports_command(ctx, subcmd: str = None, *args):
         vps = vps_list[vps_num - 1]
         container = vps['container_name']
         node_id = vps['node_id']
-        if used >= allocated:
-            await ctx.send(embed=create_error_embed("Quota Exceeded", f"No available slots. Allocated: {allocated}, Used: {used}. Contact admin for more."))
+        if used + len(port_pairs) > allocated:
+            await ctx.send(embed=create_error_embed("Quota Exceeded", f"You need {len(port_pairs)} slot(s) but only {max(0, allocated - used)} are available. Allocated: {allocated}, Used: {used}. Contact admin for more."))
             return
-        host_port = await create_port_forward(user_id, container, vps_port, node_id)
-        if host_port:
-            embed = create_success_embed("Port Forward Created", f"VPS #{vps_num} port {vps_port} (TCP/UDP) forwarded to host port {host_port}.")
-            add_field(embed, "Access", f"External: {get_public_ip()}:{host_port} → VPS:{vps_port} (TCP & UDP)", False)
-            add_field(embed, "Quota Update", f"Used: {used + 1}/{allocated}", False)
+        done, failed = [], []
+        for vp, hp in port_pairs:
+            try:
+                host_port = await create_port_forward(user_id, container, vp, node_id, hp)
+            except ValueError as ve:
+                failed.append(f"{vp}: {ve}")
+                continue
+            if host_port:
+                done.append((vp, host_port))
+            else:
+                failed.append(f"{vp}: could not create the forward")
+        if done:
+            embed = create_success_embed("Port Forward Created", f"VPS #{vps_num}: {len(done)} port forward(s) created (TCP & UDP).")
+            lines = [f"{get_public_ip()}:{hp} → VPS:{vp}" for vp, hp in done]
+            add_field(embed, "Access", "\n".join(lines[:15]) + (f"\n... +{len(lines) - 15} more (see {PREFIX}ports list)" if len(lines) > 15 else ""), False)
+            add_field(embed, "Quota Update", f"Used: {used + len(done)}/{allocated}", False)
+            if failed:
+                add_field(embed, "Failed", "\n".join(failed[:8])[:1000], False)
             await ctx.send(embed=embed)
         else:
-            await ctx.send(embed=create_error_embed("Failed", "Could not assign host port. Try again later."))
+            await ctx.send(embed=create_error_embed("Failed", ("\n".join(failed[:8]) if failed else "Could not assign host port. Try again later.")[:1500]))
     elif subcmd == 'list':
         forwards = get_user_forwards(user_id)
         embed = create_info_embed("Your Port Forwards", f"**Quota:** Allocated: {allocated}, Used: {used}, Available: {available}")
@@ -2770,6 +2906,16 @@ async def _vps_feature_report(container_name: str, node_id: int) -> Dict[str, An
         r['docker'] = "✅ Docker works (overlay2)"
     else:
         r['docker'] = f"⚠️ Docker storage driver is `{dk}` (overlay2 is best; a ZFS/btrfs LXD pool can cause this)"
+    loop = await sh("[ -c /dev/loop-control ] && echo ok || echo missing")
+    sn = await sh("command -v snap >/dev/null 2>&1 && (timeout 20 snap version >/dev/null 2>&1 && echo works || echo broken) || echo none")
+    r['snap_ok'] = (sn == "works")
+    if sn == "works":
+        r['snap'] = "✅ snap works"
+    elif sn == "none":
+        r['snap'] = ("ℹ️ snap not installed (install: `apt install snapd`, or run the setup-snap command)"
+                     + ("" if loop == "ok" else "\n❌ /dev/loop-control missing - restart the VPS once"))
+    else:
+        r['snap'] = "⚠️ snap is installed but not responding - run the setup-snap command to repair it"
     kvm = await sh("[ -c /dev/kvm ] && echo ok || echo missing")
     r['kvm'] = ("✅ /dev/kvm available - KVM / nested virtualization (QEMU, Android emulators...) works" if kvm == "ok"
                 else "ℹ️ /dev/kvm not available (host has no KVM or it is not enabled in the BIOS / hypervisor)")
@@ -2842,7 +2988,129 @@ async def fix_vps(ctx, container_name: str):
         ts_text += "\nInstall: `curl -fsSL https://tailscale.com/install.sh | sh` then `tailscale up`"
     add_field(embed, "Tailscale", ts_text[:1000], False)
     add_field(embed, "Pterodactyl / Docker", f"{report['docker']}\nAfter installing Docker, Wings needs the daemon running.", False)
+    add_field(embed, "Snap", report['snap'], False)
     add_field(embed, "KVM", report['kvm'], False)
+    add_field(embed, "Extra setup", f"`{PREFIX}setup-docker {container_name}` installs/repairs Docker (Pterodactyl Wings)\n`{PREFIX}setup-snap {container_name}` installs/repairs snap", False)
+    await msg.edit(embed=embed)
+
+# ============================================================
+#  !setup-docker / !setup-snap  - install + repair Docker (Pterodactyl Wings) and snap inside a running VPS
+# ============================================================
+DOCKER_DAEMON_JSON = '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}'
+DOCKER_DAEMON_JSON_CGROUPFS = '{"exec-opts":["native.cgroupdriver=cgroupfs"],"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}'
+
+def _b64_write_cmd(text: str, path: str) -> str:
+    """Shell command that writes `text` to `path` (base64 avoids every quoting problem inside lxc exec)."""
+    import base64
+    return f"echo {base64.b64encode(text.encode()).decode()} | base64 -d > {path}"
+
+async def _find_running_vps(ctx, container_name: str):
+    """Returns the vps dict if it exists and is running, else sends an error and returns None."""
+    _, vps = find_vps_by_container(container_name)
+    if vps is None:
+        await ctx.send(embed=create_error_embed("VPS Not Found", f"No VPS named `{container_name}`. Use `{PREFIX}list-all`."))
+        return None
+    ok, _out = await _lxc_sh(container_name, vps.get('node_id', 1), "echo up", timeout=20)
+    if not ok:
+        await ctx.send(embed=create_error_embed("VPS Not Running", f"`{container_name}` is not running. Start it first."))
+        return None
+    return vps
+
+@bot.command(name='setup-docker', aliases=['fix-docker', 'setup-wings'])
+@is_admin()
+async def setup_docker_cmd(ctx, container_name: str):
+    """!setup-docker <container>  - install / repair Docker inside the VPS (needed by Pterodactyl Wings)"""
+    vps = await _find_running_vps(ctx, container_name)
+    if vps is None:
+        return
+    node_id = vps.get('node_id', 1)
+    msg = await ctx.send(embed=create_info_embed("Docker Setup", f"Setting up Docker inside `{container_name}` (can take 2-5 minutes)..."))
+    await apply_lxc_config(container_name, node_id)
+    await apply_internal_permissions(container_name, node_id)
+    steps = []
+    ok, out = await _lxc_sh(container_name, node_id, "command -v docker >/dev/null 2>&1 && echo yes || echo no", timeout=30)
+    if not (ok and out.strip() == "yes"):
+        ok, out = await _lxc_sh(container_name, node_id,
+            "export DEBIAN_FRONTEND=noninteractive; apt-get update -y >/dev/null 2>&1; "
+            "apt-get install -y curl ca-certificates iptables >/dev/null 2>&1; "
+            "curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && sh /tmp/get-docker.sh >/tmp/get-docker.log 2>&1; "
+            "command -v docker >/dev/null 2>&1 && echo installed || (tail -n 5 /tmp/get-docker.log; echo FAILED)", timeout=900)
+        steps.append("✅ Docker installed" if ok and "installed" in out and "FAILED" not in out else f"❌ Docker install failed: {out[-200:]}")
+    else:
+        steps.append("✅ Docker already installed")
+    # iptables-legacy is the most reliable backend inside LXC (nft often is not available to the container)
+    await _lxc_sh(container_name, node_id,
+        "command -v update-alternatives >/dev/null 2>&1 && [ -x /usr/sbin/iptables-legacy ] && "
+        "(update-alternatives --set iptables /usr/sbin/iptables-legacy; update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy) >/dev/null 2>&1; true", timeout=60)
+    await _lxc_sh(container_name, node_id, "mkdir -p /etc/docker && [ -s /etc/docker/daemon.json ] || (" + _b64_write_cmd(DOCKER_DAEMON_JSON, "/etc/docker/daemon.json") + ")", timeout=30)
+    await _lxc_sh(container_name, node_id, "systemctl enable docker >/dev/null 2>&1; systemctl enable containerd >/dev/null 2>&1; systemctl restart docker", timeout=120)
+    await asyncio.sleep(4)
+    ok, drv = await _lxc_sh(container_name, node_id, "docker info --format '{{.Driver}}' 2>&1 | head -n 1", timeout=60)
+    if ok and drv.strip() == "overlay2":
+        steps.append("✅ Docker daemon running (overlay2)")
+    elif ok and drv.strip() and "Cannot connect" not in drv and "error" not in drv.lower():
+        steps.append(f"⚠️ Docker running with storage driver `{drv.strip()}` (overlay2 is best; a ZFS/btrfs LXD pool causes this)")
+    else:
+        # Retry once with the cgroupfs driver (fixes 'cgroup' errors on some hosts)
+        await _lxc_sh(container_name, node_id, _b64_write_cmd(DOCKER_DAEMON_JSON_CGROUPFS, "/etc/docker/daemon.json") + "; systemctl restart docker", timeout=120)
+        await asyncio.sleep(4)
+        ok, drv = await _lxc_sh(container_name, node_id, "docker info --format '{{.Driver}}' 2>&1 | head -n 1", timeout=60)
+        if ok and drv.strip() and "Cannot connect" not in drv and "error" not in drv.lower():
+            steps.append(f"✅ Docker running after cgroupfs fix (`{drv.strip()}`)")
+        else:
+            ok, logs = await _lxc_sh(container_name, node_id, "journalctl -u docker -n 6 --no-pager 2>&1 | tail -c 400", timeout=30)
+            steps.append(f"❌ Docker daemon is not running.\n```{logs[-350:]}```")
+    ok, test = await _lxc_sh(container_name, node_id, "timeout 90 docker run --rm hello-world 2>&1 | grep -c 'Hello from Docker' || true", timeout=120)
+    steps.append("✅ `docker run hello-world` works" if ok and test.strip() == "1" else "⚠️ test container (`hello-world`) did not run - if Docker is up, check internet/DNS inside the VPS")
+    embed = create_success_embed("Docker Setup Finished", f"`{container_name}`")
+    add_field(embed, "Result", "\n".join(steps)[:1000], False)
+    add_field(embed, "Pterodactyl Wings", (
+        "1. Install Wings from the Pterodactyl docs, paste the node config from the panel (`/etc/pterodactyl/config.yml`).\n"
+        f"2. Forward the SAME ports from the host: `{PREFIX}ports add <vps_num> 8080 same`, `{PREFIX}ports add <vps_num> 2022 same` and your game ports, e.g. `{PREFIX}ports add <vps_num> 25565-25575`.\n"
+        "3. In the panel set the node FQDN to the server's public IP/domain, Daemon Port 8080, SFTP 2022.\n"
+        "4. `systemctl enable --now wings`. If the heart is still red the panel cannot reach port 8080 - check the forward and `systemctl status wings`."), False)
+    await msg.edit(embed=embed)
+
+@bot.command(name='setup-snap', aliases=['fix-snap'])
+@is_admin()
+async def setup_snap_cmd(ctx, container_name: str):
+    """!setup-snap <container>  - install / repair snap (snapd) inside the VPS"""
+    vps = await _find_running_vps(ctx, container_name)
+    if vps is None:
+        return
+    node_id = vps.get('node_id', 1)
+    msg = await ctx.send(embed=create_info_embed("Snap Setup", f"Setting up snap inside `{container_name}` (can take 1-3 minutes)..."))
+    await apply_lxc_config(container_name, node_id)
+    steps = []
+    ok, out = await _lxc_sh(container_name, node_id, "[ -c /dev/loop-control ] && echo yes || echo no", timeout=30)
+    loop_ok = ok and out.strip() == "yes"
+    if not loop_ok:
+        steps.append("⚠️ /dev/loop-control is missing - the loop devices were just added to the VPS, **restart the VPS once** (`!manage` → Restart) and run this command again. snap can still work through squashfuse.")
+    ok, out = await _lxc_sh(container_name, node_id,
+        "export DEBIAN_FRONTEND=noninteractive; apt-get update -y >/dev/null 2>&1; "
+        "apt-get install -y snapd squashfs-tools fuse3 squashfuse >/dev/null 2>&1 || apt-get install -y snapd squashfs-tools fuse squashfuse >/dev/null 2>&1; "
+        "command -v snap >/dev/null 2>&1 && echo installed || echo FAILED", timeout=600)
+    if not (ok and "installed" in out and "FAILED" not in out):
+        steps.append(f"❌ Could not install snapd: {out[-200:]}")
+    else:
+        steps.append("✅ snapd installed")
+        await _lxc_sh(container_name, node_id,
+            "systemctl unmask snapd.service snapd.socket >/dev/null 2>&1; systemctl enable --now snapd.socket >/dev/null 2>&1; "
+            "systemctl restart snapd >/dev/null 2>&1; ln -sf /var/lib/snapd/snap /snap 2>/dev/null; true", timeout=120)
+        await asyncio.sleep(5)
+        ok, ver = await _lxc_sh(container_name, node_id, "timeout 60 snap wait system seed.loaded >/dev/null 2>&1; timeout 30 snap version 2>&1 | head -n 2", timeout=120)
+        if ok and "snapd" in ver:
+            steps.append("✅ snapd is running\n```" + ver[:150] + "```")
+            ok, t = await _lxc_sh(container_name, node_id, "timeout 150 snap install hello-world 2>&1 | tail -n 2", timeout=200)
+            if ok and ("installed" in t or "already installed" in t):
+                steps.append("✅ `snap install` works")
+                await _lxc_sh(container_name, node_id, "snap remove hello-world >/dev/null 2>&1; true", timeout=60)
+            else:
+                steps.append(f"⚠️ `snap install hello-world` failed: {t[-200:]}\nTry restarting the VPS once, then `{PREFIX}setup-snap {container_name}` again.")
+        else:
+            steps.append("❌ snapd does not answer. Restart the VPS once and run this command again.")
+    embed = create_success_embed("Snap Setup Finished", f"`{container_name}`")
+    add_field(embed, "Result", "\n".join(steps)[:1000], False)
     await msg.edit(embed=embed)
 
 # ============================================================
@@ -4140,7 +4408,7 @@ async def resource_monitor_control(ctx, action: str = "status"):
     global resource_monitor_active
     if action.lower() == "status":
         status = "Active" if resource_monitor_active else "Inactive"
-        embed = create_embed("Resource Monitor Status", f"Resource monitoring is currently **{status}** (logging + sustained-usage auto-suspend, see `{PREFIX}auto-suspend`)", 0x00ccff if resource_monitor_active else 0xffaa00)
+        embed = create_embed("Resource Monitor Status", f"Resource monitoring is currently **{status}** (logging + 24/7 usage alerts to the main admins)", 0x00ccff if resource_monitor_active else 0xffaa00)
         add_field(embed, "Thresholds", f"{CPU_THRESHOLD}% CPU / {RAM_THRESHOLD}% RAM usage", True)
         add_field(embed, "Check Interval", f"60 seconds (all nodes)", True)
         await ctx.send(embed=embed)
@@ -5184,6 +5452,8 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}delete-vps @user <vps_number> [reason]", "Delete user's VPS"),
                     (f"{PREFIX}transfer-vps <container> @new_owner [keep-shares] [keep-password]", "Transfer a VPS to another user (data is kept)"),
                     (f"{PREFIX}fix-vps <container|all>", "Fix Docker/Pterodactyl/Tailscale + SSH password login on a VPS"),
+                    (f"{PREFIX}setup-docker <container>", "Install/repair Docker (Pterodactyl Wings) inside a VPS"),
+                    (f"{PREFIX}setup-snap <container>", "Install/repair snap inside a VPS"),
                     (f"{PREFIX}add-resources <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Add resources to VPS"),
                     (f"{PREFIX}resize-vps <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Resize VPS resources"),
                     (f"{PREFIX}suspend-vps <container> [reason]", "Suspend VPS"),
@@ -5211,7 +5481,6 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}expiry-list [days]", "VPS expiring soon / already expired"),
                     (f"{PREFIX}expiry-default [days|off]", "Default expiry for new VPS"),
                     (f"{PREFIX}expiry-reminders [on|off]", "Expiry reminders + auto-suspend on/off"),
-                    (f"{PREFIX}auto-suspend [on|off] [minutes]", "Auto-suspend VPS with sustained high CPU/RAM (mining guard)")
                 ],
                 "admin_only": True
             },
@@ -6279,6 +6548,129 @@ async def usage_guard_loop():
             logger.error(f"Usage guard failed: {e}")
         await asyncio.sleep(USAGE_GUARD_INTERVAL)
 
+# ---------------------------------------------------------------- VPS usage guard (always on: suspend + DM)
+USAGE_ALERT_INTERVAL = 60            # seconds between checks (24/7)
+USAGE_ALERT_COOLDOWN = 30 * 60       # same VPS + same resource is reported again only after 30 minutes
+_usage_alert_task = None
+_vps_alert_last: Dict[Any, float] = {}
+
+def _disk_pct_from_text(text) -> float:
+    """'3.2G/10G (32%)' -> 32.0"""
+    m = re.search(r'\((\d+(?:\.\d+)?)%\)', str(text or ''))
+    return float(m.group(1)) if m else 0.0
+
+USAGE_ALERT_LIMIT = 95.0   # always on, fixed: CPU / RAM / disk of a VPS at or above 95% -> suspend + DM
+
+async def _dm_main_admins(embed) -> int:
+    sent = 0
+    for admin_id in list(main_admin_ids):
+        try:
+            user = bot.get_user(int(admin_id)) or await bot.fetch_user(int(admin_id))
+            await user.send(embed=embed)
+            sent += 1
+        except Exception as e:
+            logger.error(f"Could not DM usage alert to {admin_id}: {e}")
+    return sent
+
+async def vps_usage_alert_once():
+    """Checks CPU / RAM / disk of every running VPS (every minute). A VPS at or above USAGE_ALERT_LIMIT is
+    SUSPENDED right away and the owner + all main admins get a DM. Whitelisted VPS (!whitelist-vps) are never
+    suspended, they only trigger the DM."""
+    global _guard_alert_ts
+    limit = USAGE_ALERT_LIMIT
+    now = time.time()
+    targets = []
+    for uid, lst in list(vps_data.items()):
+        for vps in list(lst):
+            if vps.get('status') == 'running' and not vps.get('suspended'):
+                targets.append((uid, vps))
+    sem = asyncio.Semaphore(5)
+
+    async def probe(uid, vps):
+        async with sem:
+            try:
+                return uid, vps, await _sample_stats(vps['container_name'], vps.get('node_id'))
+            except Exception as e:
+                logger.warning(f"Usage alert: stats failed for {vps['container_name']}: {e}")
+                return None
+
+    results = await asyncio.gather(*[probe(u, v) for u, v in targets])
+    offenders = []   # (uid, vps, values, [hot kinds])
+    for r in results:
+        if not r:
+            continue
+        uid, vps, st = r
+        c = vps['container_name']
+        if str(st.get('status', '')).lower() != 'running':
+            continue
+        try:
+            values = {
+                'CPU': float(st.get('cpu') or 0),
+                'RAM': float((st.get('ram') or {}).get('pct') or 0),
+                'DISK': _disk_pct_from_text(st.get('disk')),
+            }
+        except Exception:
+            continue
+        hot = [k for k, v in values.items() if v >= limit]
+        if hot:
+            offenders.append((uid, vps, values, hot))
+        else:
+            for k in values:
+                _vps_alert_last.pop((c, k), None)
+    if not offenders:
+        return
+
+    def _fmt(values, hot):
+        return " • ".join(f"**{k} {values[k]:.0f}%**" for k in hot) + f"\n   CPU {values['CPU']:.0f}% | RAM {values['RAM']:.0f}% | Disk {values['DISK']:.0f}%"
+
+    # Safety net: many VPS "hot" in the same minute is almost surely a measuring problem -> DM only, nobody suspended.
+    if len(offenders) > MAX_AUTO_SUSPEND_PER_CYCLE:
+        if now - _guard_alert_ts >= USAGE_ALERT_COOLDOWN:
+            _guard_alert_ts = now
+            lines = [f"🔥 `{o[1]['container_name']}` • <@{o[0]}> • {_fmt(o[2], o[3])}" for o in offenders[:12]]
+            await _dm_main_admins(create_warning_embed(f"⚠️ {len(offenders)} VPS at/above {limit:.0f}% at the same time",
+                "\n".join(lines)[:3500] + f"\n\nThat many at once looks like a measuring problem, so **nobody was suspended**. "
+                f"Check `{PREFIX}health`, suspend manually with `{PREFIX}suspend-vps <container>`."))
+        return
+
+    admin_lines = []
+    for uid, vps, values, hot in offenders:
+        c = vps['container_name']
+        node = get_node(vps.get('node_id', 1)) or {}
+        head = f"`{c}` • <@{uid}> • node {node.get('name', '?')} • "
+        if vps.get('whitelisted'):
+            # never suspended - DM only, and not more often than every 30 minutes per VPS
+            fresh = [k for k in hot if now - _vps_alert_last.get((c, k), 0) >= USAGE_ALERT_COOLDOWN]
+            if fresh:
+                for k in fresh:
+                    _vps_alert_last[(c, k)] = now
+                admin_lines.append(f"🔥 {head}{_fmt(values, hot)}\n   whitelisted - not suspended")
+            continue
+        reason = "High resource usage: " + ", ".join(f"{k} {values[k]:.0f}%" for k in hot) + f" (limit {limit:.0f}%)"
+        logger.warning(f"Auto-suspending {c}: {reason}")
+        ok = await suspend_vps_record(vps, reason, "Auto Usage Guard")
+        if not ok:
+            admin_lines.append(f"⚠️ {head}{_fmt(values, hot)}\n   auto-suspend FAILED - suspend it manually")
+            continue
+        embed = create_error_embed("🚨 VPS Suspended - High Usage",
+            f"Your VPS `{c}` was **automatically suspended** because it reached **{', '.join(f'{k} {values[k]:.0f}%' for k in hot)}** "
+            f"(limit {limit:.0f}%).\nContact the administrator.")
+        delivered = await _dm_user(uid, embed)
+        admin_lines.append(f"🚨 {head}{_fmt(values, hot)}\n   ✅ suspended" + ("" if delivered else " • ⚠️ owner DM failed"))
+    if admin_lines:
+        await _dm_main_admins(create_warning_embed(f"🚨 High VPS Usage (>= {limit:.0f}%)",
+            "\n".join(admin_lines)[:3600] + f"\n\nUnsuspend: `{PREFIX}unsuspend-vps <container>` • whitelist: `{PREFIX}whitelist-vps <container> add`"))
+        logger.warning(f"Usage guard: {len(admin_lines)} VPS handled - DM sent to main admins")
+
+async def vps_usage_alert_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await vps_usage_alert_once()
+        except Exception as e:
+            logger.error(f"VPS usage alert loop failed: {e}")
+        await asyncio.sleep(USAGE_ALERT_INTERVAL)
+
 # ---------------------------------------------------------------- !myexpiry
 @bot.command(name='myexpiry')
 async def myexpiry_cmd(ctx):
@@ -6436,32 +6828,6 @@ async def expiry_reminders_cmd(ctx, state: str = None):
         return
     set_setting('expiry_reminders', '1' if state.lower() == 'on' else '0')
     await ctx.send(embed=create_success_embed("Expiry Reminders", f"Expiry reminders + auto-suspend are now **{state.upper()}**."))
-
-# ---------------------------------------------------------------- !auto-suspend (usage guard)
-@bot.command(name='auto-suspend')
-@is_admin()
-async def auto_suspend_cmd(ctx, state: str = None, minutes: int = None):
-    """!auto-suspend [on|off] [minutes] - suspend VPS that stay above the CPU/RAM limit"""
-    if state is not None:
-        if state.lower() not in ('on', 'off'):
-            await ctx.send(embed=create_error_embed("Invalid Value", f"Use `{PREFIX}auto-suspend on [minutes]` or `off`."))
-            return
-        if minutes is not None:
-            if minutes < 1 or minutes > 120:
-                await ctx.send(embed=create_error_embed("Invalid Minutes", "Minutes must be between 1 and 120."))
-                return
-            set_setting('auto_suspend_minutes', str(minutes))
-        set_setting('auto_suspend', '1' if state.lower() == 'on' else '0')
-        if state.lower() == 'off':
-            _usage_since.clear()
-    on = str(get_setting('auto_suspend', '1')) == '1'
-    mins = get_setting('auto_suspend_minutes', '5')
-    await ctx.send(embed=create_info_embed("🛡️ Auto-Suspend (mining / abuse guard)",
-        f"Status: {'🟢 ON' if on else '🔴 OFF'}\n"
-        f"A running VPS is suspended when it stays above **{CPU_THRESHOLD}% CPU** or **{RAM_THRESHOLD}% RAM** for **{mins} minutes** in a row.\n"
-        f"Whitelisted VPS (`{PREFIX}whitelist-vps`) are never auto-suspended. "
-        f"Change the limits with `{PREFIX}set-threshold <cpu> <ram>`.\n"
-        f"Safety: if more than {MAX_AUTO_SUSPEND_PER_CYCLE} VPS trigger at once, nothing is suspended and admins get a warning."))
 
 # Run the bot
 if __name__ == "__main__":

@@ -269,12 +269,18 @@ final_message() {
 
 # ---------- Host kernel modules (Docker / Pterodactyl / Tailscale inside VPS) ----------
 prepare_host_modules() {
-    step "Loading kernel modules (tun, overlay, br_netfilter)..."
-    for m in tun overlay br_netfilter; do modprobe "$m" 2>/dev/null || warn "Could not load module $m (may be built in)"; done
-    printf 'tun\noverlay\nbr_netfilter\n' > /etc/modules-load.d/bvm.conf
+    step "Loading kernel modules (Docker / Wings / snap / Tailscale / KVM support)..."
+    MODS="tun overlay br_netfilter bridge veth loop squashfs fuse ip_tables ip6_tables iptable_nat iptable_filter iptable_mangle nf_nat nf_conntrack xt_conntrack xt_MASQUERADE xt_addrtype xt_mark nfnetlink vxlan netlink_diag vhost_net kvm kvm_intel kvm_amd"
+    : > /etc/modules-load.d/bvm.conf
+    for m in $MODS; do
+        if modprobe "$m" 2>/dev/null; then echo "$m" >> /etc/modules-load.d/bvm.conf; fi
+    done
     if [ ! -c /dev/net/tun ]; then
         mkdir -p /dev/net && mknod /dev/net/tun c 10 200 2>/dev/null && chmod 666 /dev/net/tun || true
     fi
+    [ -c /dev/fuse ] || { mknod /dev/fuse c 10 229 2>/dev/null && chmod 666 /dev/fuse; } || true
+    [ -c /dev/loop-control ] || mknod /dev/loop-control c 10 237 2>/dev/null || true
+    for i in 0 1 2 3 4 5 6 7; do [ -b /dev/loop$i ] || mknod /dev/loop$i b 7 $i 2>/dev/null || true; done
 }
 
 main() {

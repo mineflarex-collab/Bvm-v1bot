@@ -109,18 +109,6 @@ Every VPS can have an expiry date. Set it when creating: `!create 1 1 5 @user 30
 
 Existing VPS start with **no expiry** (use `!set-expiry`). Dates use the server's time zone. Expiry is shown in `!manage`, `!vpsinfo` and `!dashboard`.
 
-## Auto-Suspend for High Usage (mining / abuse guard)
-
-A running VPS that stays above the **CPU or RAM limit (default 90%) for 5 minutes in a row** is stopped and suspended automatically; the owner gets a DM and the admins an alert. Whitelisted VPS (`!whitelist-vps <container> add`) are skipped.
-
-| Command | What it does |
-|---|---|
-| `!auto-suspend` | Shows the status |
-| `!auto-suspend on [minutes]` / `off` | Turns the guard on/off, optionally sets how many minutes (1-120) |
-| `!set-threshold <cpu> <ram>` | Changes the CPU/RAM limits |
-
-Safety net: if more than 3 VPS trigger in the same check, nobody is suspended and the admins get a warning (that is almost always a measuring problem, not mining). Unsuspend with `!unsuspend-vps <container>`.
-
 ## Custom Prefix
 
 `!prefix` shows the current prefix. `!prefix 1` changes it (then use `1help`, `1myvps`...). `!prefix reset` goes back to the default from `bot.service`. Saved in the database, so it survives restarts. If you forget it, mention the bot: `@Bot prefix reset`. Main Admin only (also works as `!set-prefix`), 1-5 characters.
@@ -164,3 +152,23 @@ Multiple main admins are stored in the database (seeded from `MAIN_ADMIN_ID`), s
 - The bot runs as **root** because it directly manages LXC containers via `lxc`/`lxd` — keep the bot token and server access secured.
 - `vps.db` (SQLite) is created automatically in `/root` on first run and stores nodes, VPS records, admins, and settings.
 - Run `!help` in Discord after the bot is online to see the full command list.
+
+
+## Pterodactyl Wings (node) and snap inside a VPS - v6.1 fixes
+
+- Every VPS now also gets `/dev/loop-control` + `/dev/loop0-7` (snap needs them), a kernel-module list that only contains modules the host really has (LXD refuses to start a VPS with an unloadable module), `ip_forward`, and the wrong `shmounts:rw` mount option was removed.
+- `!setup-docker <container>` (aliases `!fix-docker`, `!setup-wings`): installs/repairs Docker (iptables-legacy, cgroupfs fallback, test container) and prints the Wings checklist.
+- `!setup-snap <container>` (alias `!fix-snap`): installs/repairs snapd (+ squashfuse) and tests `snap install`.
+- `!fix-vps` now also reports snap status.
+- Port forwarding for Wings / game servers: `!ports add <vps#> 8080 same`, `!ports add <vps#> 2022 same`, `!ports add <vps#> <port> <host_port>` or a range `!ports add <vps#> 25565-25575` (1 quota slot per port, raise it with the admin quota command).
+- `node-agent.py` and the installer load the same kernel modules/devices on the host. **Existing VPS:** update the bot (install.sh option 3), restart `node-agent.py` on remote nodes, then run `!fix-vps all` and restart each VPS once so the loop devices appear.
+
+## VPS Usage Guard (always on: suspend + DM, checked every minute)
+
+Starts **automatically** with the bot (after install and after every update) - no command, no on/off switch. **Every 1 minute** the bot checks **CPU, RAM and disk of every running VPS**. A VPS at or above **95%** is **suspended immediately** and the **owner and all main admins get a DM** (VPS, owner, node, values).
+
+- Whitelisted VPS (`!whitelist-vps <container> add`) are never suspended; the main admins only get the DM (max. once per 30 minutes per VPS).
+- Safety net: if more than 3 VPS are above the limit in the same minute, nobody is suspended and the main admins get a warning (that is almost always a measuring problem).
+- Unsuspend with `!unsuspend-vps <container>`.
+- CPU is measured with the second `top` sample (the first one is only the average since boot), so readings are accurate.
+- Host/node CPU/RAM/disk alerts stay in `!alerts`.
