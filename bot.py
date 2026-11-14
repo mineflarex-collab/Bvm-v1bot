@@ -47,14 +47,12 @@ def get_public_ip() -> str:
         logger.warning(f"Failed to fetch public IP from ifconfig.me: {e}")
     return YOUR_SERVER_IP
 
-# ---- IPv4-only VPS mode (!ipv4vps-on / !ipv4vps-off) ----
-# ON  -> VPS are only created on nodes that have a real public IPv4 (otherwise an error is shown)
-#        and users only ever get a direct IPv4 SSH address (no IPv6 / Pinggy hostname fallback).
-# OFF -> (default) non-IPv4 / IPv6-only servers can create VPS too, Pinggy fallback allowed.
+# ---- Automatic IPv4 check (no on/off command) ----
+# SSH access is always given through the Pinggy tunnel. When a VPS is created / started / reconnected the bot checks
+# whether the node has a public IPv4: with IPv4 the VPS is IPv4 (its Pinggy tunnel runs over IPv4), without IPv4 the VPS is
+# non-IPv4 and the notice "This VPS is not IPv4" is shown. The address given to the user is always the normal Pinggy hostname.
 _cached_public_ipv4 = None
-
-def ipv4_only_enabled() -> bool:
-    return str(get_setting('ipv4_only', '0')) == '1'
+_ipv4_fail_ts = 0.0
 
 def _is_public_ipv4(value) -> bool:
     try:
@@ -65,9 +63,11 @@ def _is_public_ipv4(value) -> bool:
 
 def get_public_ipv4_sync() -> Optional[str]:
     """The server's public IPv4 (asks IPv4-only services so an IPv6 answer can never sneak in). None if it has no IPv4."""
-    global _cached_public_ipv4
+    global _cached_public_ipv4, _ipv4_fail_ts
     if _cached_public_ipv4:
         return _cached_public_ipv4
+    if time.time() - _ipv4_fail_ts < 300 and not _is_public_ipv4(YOUR_SERVER_IP):
+        return None   # looked up a moment ago and found no IPv4 - do not wait for the timeouts again
     for url in ("https://api.ipify.org", "https://ipv4.icanhazip.com", "https://v4.ident.me"):
         try:
             ip = requests.get(url, timeout=5).text.strip()
@@ -78,6 +78,7 @@ def get_public_ipv4_sync() -> Optional[str]:
             logger.warning(f"IPv4 lookup via {url} failed: {e}")
     if _is_public_ipv4(YOUR_SERVER_IP):   # manual override from the service file / env
         return YOUR_SERVER_IP
+    _ipv4_fail_ts = time.time()
     return None
 
 def node_ipv4_sync(node: Dict) -> Optional[str]:
@@ -105,11 +106,9 @@ async def node_has_ipv4(node_id: int) -> bool:
     return bool(await asyncio.to_thread(node_ipv4_sync, node))
 
 async def check_node_ipv4(node_id: int, for_start: bool = False):
-    """(ok, notice_text). While !ipv4vps-on is active and the node has no public IPv4 it returns (False, notice).
-    The notice is only SHOWN - nothing is blocked: the VPS is still created/started and gets a Pinggy (non-IPv4) address.
+    """(ok, notice_text). (False, notice) when the node has no public IPv4.
+    The notice is only SHOWN - nothing is blocked: the VPS is still created/started and gets a non-IPv4 Pinggy address.
     for_start=True is used when a VPS is switched on (start/restart)."""
-    if not ipv4_only_enabled():
-        return True, None
     node = get_node(node_id)
     if not node:
         return False, f"Node `{node_id}` was not found."
@@ -117,10 +116,10 @@ async def check_node_ipv4(node_id: int, for_start: bool = False):
     if ip:
         return True, None
     if for_start:
-        return False, (f"❌ **This VPS is not IPv4.**\nNode **{node['name']}** has no public IPv4 address (IPv4-only mode is **ON**).\n"
-                       f"The VPS is started anyway and uses a **Pinggy (non-IPv4) address** for SSH.")
-    return False, (f"❌ **This VPS is not IPv4.**\nNode **{node['name']}** has no public IPv4 address (IPv4-only mode is **ON**).\n"
-                   f"The VPS is still created and gets a **Pinggy (non-IPv4) address** for SSH.")
+        return False, (f"❌ **This VPS is not IPv4.**\nNode **{node['name']}** has no public IPv4 address.\n"
+                       f"The VPS is started anyway and connects through a **non-IPv4 Pinggy address**.")
+    return False, (f"❌ **This VPS is not IPv4.**\nNode **{node['name']}** has no public IPv4 address.\n"
+                   f"The VPS is still created and connects through a **non-IPv4 Pinggy address**.")
 _raw_main_admin_ids = os.getenv('MAIN_ADMIN_ID', '1405866008127864852')
 MAIN_ADMIN_IDS_ENV = [uid.strip() for uid in _raw_main_admin_ids.split(',') if uid.strip()]
 MAIN_ADMIN_ID = int(MAIN_ADMIN_IDS_ENV[0])  # kept for backward-compat display purposes
@@ -557,9 +556,7 @@ def node_public_host(node_id: int) -> str:
     """Public address people connect to for a node: the bot server's IPv4 for the local node, the node's own host otherwise."""
     node = get_node(node_id) or {}
     if node.get('is_local'):
-        if ipv4_only_enabled():
-            return get_public_ipv4_sync() or get_public_ip()
-        return get_public_ip()
+        return get_public_ipv4_sync() or get_public_ip()
     from urllib.parse import urlparse
     return urlparse(node.get('url') or '').hostname or get_public_ip()
 
@@ -583,45 +580,13 @@ async def ensure_ssh_forward(container: str, node_id: int, owner_id) -> Optional
             return None
     return f"{node_public_host(node_id)}:{host_port}"
 
-async def pinggy_to_ipv4(address: str) -> str:
-    """'host:port' -> 'IPv4:port' (A record of the Pinggy host). Keeps the hostname if it has no IPv4."""
-    host, _, port = address.rpartition(':')
-    if not host or _is_public_ipv4(host):
-        return address
-    try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, None, socket.AF_INET)
-        for info in infos:
-            ip = info[4][0]
-            if _is_public_ipv4(ip):
-                logger.info(f"Pinggy {host} -> IPv4 {ip}")
-                return f"{ip}:{port}"
-    except Exception as e:
-        logger.warning(f"Pinggy IPv4 lookup for {host} failed: {e}")
-    return address
-
 async def get_pinggy_access(container: str, node_id: int) -> Optional[str]:
-    """Pinggy tunnel address. With !ipv4vps-on and an IPv4 node it is given as IPv4:port, otherwise as the normal Pinggy hostname."""
-    address = await establish_pinggy_tunnel(container, node_id)
-    if address and ipv4_only_enabled() and await node_has_ipv4(node_id):
-        address = await pinggy_to_ipv4(address)
-    return address
+    """Normal Pinggy hostname:port. On a node with public IPv4 the VPS tunnels over IPv4 (ssh -4), so the VPS is IPv4."""
+    return await establish_pinggy_tunnel(container, node_id, ipv4=await node_has_ipv4(node_id))
 
 async def establish_ssh_access(container: str, node_id: int, owner_id) -> Optional[str]:
-    """Direct SSH on the server's real IPv4 with a random port per VPS (preferred).
-    Only if that fails the old Pinggy tunnel is used as a fallback. Returns 'host:port' or None."""
-    if str(get_setting('ssh_mode', 'direct')) == 'pinggy':
-        # !ssh-mode pinggy: always use the Pinggy tunnel (works even when the host firewall / cloud security group blocks the 20000-50000 ports)
-        return await get_pinggy_access(container, node_id)
-    if ipv4_only_enabled() and not await node_has_ipv4(node_id):
-        # IPv4-only mode is ON but this node has no IPv4 -> no direct IPv4 address possible, use the Pinggy tunnel
-        logger.info(f"{container}: node {node_id} has no IPv4, using the Pinggy tunnel")
-        return await get_pinggy_access(container, node_id)
-    try:
-        address = await ensure_ssh_forward(container, node_id, owner_id)
-        if address:
-            return address
-    except Exception as e:
-        logger.warning(f"Direct SSH forward failed for {container}: {e}")
+    """SSH access is always given through the Pinggy tunnel (normal Pinggy hostname, no server IP / port forward,
+    so no firewall ports are needed). IPv4 node -> the VPS is IPv4 inside; no IPv4 -> non-IPv4. Returns 'host:port' or None."""
     return await get_pinggy_access(container, node_id)
 
 def find_node_id_for_container(container_name: str) -> int:
@@ -1030,7 +995,7 @@ def parse_pinggy_address(log_text: str) -> Optional[str]:
         return f"{match.group(1)}:{match.group(2)}"
     return None
 
-async def establish_pinggy_tunnel(container_name: str, node_id: int, retries: int = 4, wait_seconds: int = 5) -> Optional[str]:
+async def establish_pinggy_tunnel(container_name: str, node_id: int, retries: int = 4, wait_seconds: int = 5, ipv4: bool = False) -> Optional[str]:
     """
     Runs 'ssh -p 443 -R0:localhost:22 qr+tcp@free.pinggy.io' inside the container
     (equivalent to: lxc exec <container> -- bash, then running that ssh command and
@@ -1061,7 +1026,7 @@ async def establish_pinggy_tunnel(container_name: str, node_id: int, retries: in
     # Start the tunnel in the background. -o StrictHostKeyChecking=no auto-accepts the
     # host key prompt (the 'always yes' behavior), so it never blocks waiting for input.
     tunnel_cmd = (
-        "setsid nohup ssh -p 443 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"setsid nohup ssh {'-4 ' if ipv4 else ''}-p 443 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
         "-o ServerAliveInterval=30 -R0:localhost:22 qr+tcp@free.pinggy.io "
         f"> {PINGGY_LOG_PATH} 2>&1 < /dev/null & disown"
     )
@@ -1947,55 +1912,6 @@ class OSSelectView(discord.ui.View):
         except Exception as e:
             error_embed = create_error_embed("Creation Failed", f"Error: {str(e)}")
             await interaction.followup.send(embed=error_embed)
-
-@bot.command(name='ssh-mode')
-@is_main_admin()
-async def ssh_mode_cmd(ctx, mode: str = None):
-    """!ssh-mode [direct|pinggy] - how SSH addresses are given: direct = server IP + own port, pinggy = Pinggy tunnel (no open ports needed)"""
-    cur = str(get_setting('ssh_mode', 'direct'))
-    if mode is None:
-        embed = create_info_embed("SSH mode", f"Current: **{cur}**")
-        add_field(embed, "Options", f"`{PREFIX}ssh-mode direct` - server IP + own port per VPS (needs ports 20000-50000 open in the firewall / cloud security group)\n`{PREFIX}ssh-mode pinggy` - Pinggy tunnel, works without opening any port", False)
-        await ctx.send(embed=embed)
-        return
-    mode = mode.lower()
-    if mode not in ('direct', 'pinggy'):
-        await ctx.send(embed=create_error_embed("Invalid mode", "Use `direct` or `pinggy`."))
-        return
-    set_setting('ssh_mode', mode)
-    embed = create_success_embed("SSH mode updated", f"SSH mode is now **{mode}**.")
-    add_field(embed, "Applies to", "New VPS, and existing VPS after 🔌 **Reconnect Tunnel** in `" + PREFIX + "manage`. Existing addresses are not changed automatically.", False)
-    if mode == 'pinggy':
-        add_field(embed, "Note", f"With `{PREFIX}ipv4vps-on` the Pinggy address is given as **IPv4:port** when the node has IPv4, otherwise as the normal Pinggy hostname. Free Pinggy tunnels can drop and the address can change - use 🔌 Reconnect Tunnel to get a new one.", False)
-    await ctx.send(embed=embed)
-
-@bot.command(name='ipv4vps-on')
-@is_main_admin()
-async def ipv4vps_on(ctx):
-    """!ipv4vps-on - IPv4 mode: nodes without IPv4 show a 'not IPv4' error and the VPS gets a Pinggy address"""
-    set_setting('ipv4_only', '1')
-    lines, missing = [], []
-    for n in get_nodes():
-        ip = await asyncio.to_thread(node_ipv4_sync, n)
-        lines.append(f"{'✅' if ip else '❌'} **{n['name']}** - {ip or 'no IPv4'}")
-        if not ip:
-            missing.append(n['name'])
-    embed = create_success_embed("IPv4-only VPS: ON", "VPS on nodes with a public IPv4 get a direct IPv4 SSH address (own port per VPS).\nNodes without IPv4 show the error **This VPS is not IPv4** and the VPS automatically gets a **Pinggy** address instead.")
-    if lines:
-        add_field(embed, "Node IPv4 check", "\n".join(lines), False)
-    if missing:
-        add_field(embed, "⚠️ Warning", f"No IPv4 on: {', '.join(missing)}. VPS there show the 'not IPv4' error and use Pinggy.", False)
-    add_field(embed, "Turn off", f"`{PREFIX}ipv4vps-off` - back to normal", False)
-    await ctx.send(embed=embed)
-
-@bot.command(name='ipv4vps-off')
-@is_main_admin()
-async def ipv4vps_off(ctx):
-    """!ipv4vps-off - non-IPv4 (IPv6-only) servers can create VPS too"""
-    set_setting('ipv4_only', '0')
-    embed = create_success_embed("IPv4-only VPS: OFF", "VPS can now be created on every node, including nodes / servers without IPv4 (the Pinggy tunnel fallback is allowed again).")
-    add_field(embed, "Turn on", f"`{PREFIX}ipv4vps-on` - only IPv4 VPS", False)
-    await ctx.send(embed=embed)
 
 @bot.command(name='create')
 @is_admin()
@@ -3205,7 +3121,7 @@ async def fix_vps(ctx, container_name: str):
     add_field(embed, "SSH password login", ssh_line, False)
     if direct_addr:
         h_, p_ = direct_addr.rsplit(":", 1)
-        add_field(embed, "SSH address (direct IPv4)", f"```ssh root@{h_} -p {p_}```", False)
+        add_field(embed, "SSH address (Pinggy)", f"```ssh root@{h_} -p {p_}```", False)
     ts_text = f"{report['tun']}\n{report['tailscale']}"
     if restarted:
         ts_text += "\n🔄 tailscaled restarted"
@@ -5720,9 +5636,7 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}add-admin <user_id>", "Add main admin (by ID)"),
                     (f"{PREFIX}rm-admin <user_id>", "Remove main admin (by ID)"),
                     (f"{PREFIX}admin-list", "List admins"),
-                    (f"{PREFIX}prefix [new|reset]", "Show / change the bot command prefix"),
-                    (f"{PREFIX}ssh-mode [direct|pinggy]", "SSH address type: direct IP:port or Pinggy tunnel (no open ports needed)"),
-                    (f"{PREFIX}ipv4vps-on / {PREFIX}ipv4vps-off", "ON: IPv4 address (no IPv4 on node = error + Pinggy address) / OFF: normal")
+                    (f"{PREFIX}prefix [new|reset]", "Show / change the bot command prefix")
                 ],
                 "admin_only": True,
                 "main_admin_only": True
@@ -6181,7 +6095,7 @@ async def refresh_presence():
         if maintenance_on():
             await bot.change_presence(status=discord.Status.dnd, activity=discord.Activity(type=discord.ActivityType.playing, name="🛠️ Maintenance mode"))
         else:
-            await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name=f"{BOT_NAME} VPS Manager"))
+            await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="Made By MineFlareX BVM VPS Deploy Machine"))
     except Exception as e:
         logger.error(f"Presence update failed: {e}")
 
