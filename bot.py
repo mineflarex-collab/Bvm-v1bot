@@ -18,6 +18,7 @@ import secrets
 import string
 import re
 import socket
+import ipaddress
 import glob
 
 # Load environment variables
@@ -45,6 +46,71 @@ def get_public_ip() -> str:
     except Exception as e:
         logger.warning(f"Failed to fetch public IP from ifconfig.me: {e}")
     return YOUR_SERVER_IP
+
+# ---- IPv4-only VPS mode (!ipv4vps-on / !ipv4vps-off) ----
+# ON  -> VPS are only created on nodes that have a real public IPv4 (otherwise an error is shown)
+#        and users only ever get a direct IPv4 SSH address (no IPv6 / Pinggy hostname fallback).
+# OFF -> (default) non-IPv4 / IPv6-only servers can create VPS too, Pinggy fallback allowed.
+_cached_public_ipv4 = None
+
+def ipv4_only_enabled() -> bool:
+    return str(get_setting('ipv4_only', '0')) == '1'
+
+def _is_public_ipv4(value) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return False
+    return ip.version == 4 and ip.is_global
+
+def get_public_ipv4_sync() -> Optional[str]:
+    """The server's public IPv4 (asks IPv4-only services so an IPv6 answer can never sneak in). None if it has no IPv4."""
+    global _cached_public_ipv4
+    if _cached_public_ipv4:
+        return _cached_public_ipv4
+    for url in ("https://api.ipify.org", "https://ipv4.icanhazip.com", "https://v4.ident.me"):
+        try:
+            ip = requests.get(url, timeout=5).text.strip()
+            if _is_public_ipv4(ip):
+                _cached_public_ipv4 = ip
+                return ip
+        except Exception as e:
+            logger.warning(f"IPv4 lookup via {url} failed: {e}")
+    if _is_public_ipv4(YOUR_SERVER_IP):   # manual override from the service file / env
+        return YOUR_SERVER_IP
+    return None
+
+def node_ipv4_sync(node: Dict) -> Optional[str]:
+    """Public IPv4 of a node: the bot server's IPv4 for the local node, the node host's IPv4 (literal or A record) otherwise."""
+    if node.get('is_local'):
+        return get_public_ipv4_sync()
+    from urllib.parse import urlparse
+    host = urlparse(node.get('url') or '').hostname
+    if not host:
+        return None
+    if _is_public_ipv4(host):
+        return host
+    try:
+        for info in socket.getaddrinfo(host, None, socket.AF_INET):
+            if _is_public_ipv4(info[4][0]):
+                return info[4][0]
+    except Exception:
+        pass
+    return None
+
+async def check_node_ipv4(node_id: int):
+    """(ok, error_text). Only blocks while !ipv4vps-on is active; with it OFF every node is accepted."""
+    if not ipv4_only_enabled():
+        return True, None
+    node = get_node(node_id)
+    if not node:
+        return False, f"Node `{node_id}` was not found."
+    ip = await asyncio.to_thread(node_ipv4_sync, node)
+    if ip:
+        return True, None
+    return False, (f"Node **{node['name']}** has no public IPv4 address, and IPv4-only mode is **ON**.\n"
+                   f"No VPS was created. Pick a node that has IPv4, or ask the main admin to run `{PREFIX}ipv4vps-off` "
+                   f"to allow non-IPv4 VPS.")
 _raw_main_admin_ids = os.getenv('MAIN_ADMIN_ID', '1405866008127864852')
 MAIN_ADMIN_IDS_ENV = [uid.strip() for uid in _raw_main_admin_ids.split(',') if uid.strip()]
 MAIN_ADMIN_ID = int(MAIN_ADMIN_IDS_ENV[0])  # kept for backward-compat display purposes
@@ -327,7 +393,7 @@ def get_user_allocation(user_id: str) -> int:
 def get_user_used_ports(user_id: str) -> int:
     conn = get_db()
     cur = conn.cursor()
-    cur.execute('SELECT COUNT(*) FROM port_forwards WHERE user_id = ?', (user_id,))
+    cur.execute('SELECT COUNT(*) FROM port_forwards WHERE user_id = ? AND vps_port != 22', (user_id,))   # the automatic SSH forward (port 22) is free
     row = cur.fetchone()
     conn.close()
     return row[0]
@@ -379,10 +445,16 @@ def get_available_host_port(node_id: int) -> Optional[int]:
         return port
     return None
 
-async def create_port_forward(user_id: str, container: str, vps_port: int, node_id: int, host_port: Optional[int] = None) -> Optional[int]:
+async def create_port_forward(user_id: str, container: str, vps_port: int, node_id: int, host_port: Optional[int] = None, internal: bool = False) -> Optional[int]:
     """Forwards TCP+UDP host_port -> VPS vps_port. host_port=None picks a random free port (20000-50000).
     A fixed host_port (e.g. the same as vps_port, which Pterodactyl Wings / game servers need) raises ValueError
     with a readable message if it cannot be used."""
+    if vps_port == 22 and not internal:
+        conn = get_db()
+        has_ssh = conn.execute('SELECT 1 FROM port_forwards WHERE vps_container = ? AND vps_port = 22', (container,)).fetchone()
+        conn.close()
+        if has_ssh:
+            raise ValueError("Port 22 (SSH) is already forwarded automatically - see your SSH login in the manage panel.")
     if host_port is None:
         host_port = get_available_host_port(node_id)
         if not host_port:
@@ -470,6 +542,50 @@ async def recreate_port_forwards(container_name: str) -> int:
             logger.error(f"Failed to re-add port forward {host_port}->{vps_port} for {container_name}: {e}")
     conn.close()
     return readded_count
+
+def node_public_host(node_id: int) -> str:
+    """Public address people connect to for a node: the bot server's IPv4 for the local node, the node's own host otherwise."""
+    node = get_node(node_id) or {}
+    if node.get('is_local'):
+        if ipv4_only_enabled():
+            return get_public_ipv4_sync() or get_public_ip()
+        return get_public_ip()
+    from urllib.parse import urlparse
+    return urlparse(node.get('url') or '').hostname or get_public_ip()
+
+async def ensure_ssh_forward(container: str, node_id: int, owner_id) -> Optional[str]:
+    """Gives the VPS a direct SSH address on the server's own IPv4: `IP:<random port>` -> VPS port 22.
+    Reuses the existing forward (and re-adds its proxy device if it is missing). Returns 'host:port' or None."""
+    conn = get_db()
+    row = conn.execute('SELECT host_port FROM port_forwards WHERE vps_container = ? AND vps_port = 22 ORDER BY id LIMIT 1', (container,)).fetchone()
+    conn.close()
+    if row:
+        host_port = int(row[0])
+        try:
+            devices = await execute_lxc(container, f"config device list {container}", node_id=node_id)
+            if isinstance(devices, str) and f"tcp_proxy_{host_port}" not in devices:
+                await recreate_port_forwards(container)
+        except Exception as e:
+            logger.warning(f"ensure_ssh_forward: could not verify devices of {container}: {e}")
+    else:
+        host_port = await create_port_forward(str(owner_id), container, 22, node_id, internal=True)
+        if not host_port:
+            return None
+    return f"{node_public_host(node_id)}:{host_port}"
+
+async def establish_ssh_access(container: str, node_id: int, owner_id) -> Optional[str]:
+    """Direct SSH on the server's real IPv4 with a random port per VPS (preferred).
+    Only if that fails the old Pinggy tunnel is used as a fallback. Returns 'host:port' or None."""
+    try:
+        address = await ensure_ssh_forward(container, node_id, owner_id)
+        if address:
+            return address
+    except Exception as e:
+        logger.warning(f"Direct SSH forward failed for {container}: {e}")
+    if ipv4_only_enabled():
+        logger.warning(f"IPv4-only mode is ON: skipping the Pinggy fallback for {container}")
+        return None
+    return await establish_pinggy_tunnel(container, node_id)
 
 def find_node_id_for_container(container_name: str) -> int:
     conn = get_db()
@@ -799,7 +915,7 @@ async def apply_internal_permissions(container_name: str, node_id: int):
     except Exception as e:
         logger.error(f"Failed to apply internal permissions to {container_name}: {e}")
 
-def generate_password(length: int = 16) -> str:
+def generate_password(length: int = 24) -> str:
     """Generate a random alnum-only password (safe to embed in shell commands)."""
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
@@ -1688,6 +1804,10 @@ class NodeSelectView(discord.ui.View):
         node_id = int(self.select.values[0])
         self.select.disabled = True
         await interaction.response.edit_message(view=self)
+        ok, err = await check_node_ipv4(node_id)
+        if not ok:
+            await interaction.followup.send(embed=create_error_embed("No IPv4 on this node", err))
+            return
         os_view = OSSelectView(self.ram, self.cpu, self.disk, self.user, self.ctx, node_id, self.days)
         await interaction.followup.send(embed=create_info_embed("Select OS", "Choose the OS for the VPS."), view=os_view)
 
@@ -1714,6 +1834,10 @@ class OSSelectView(discord.ui.View):
             return
         os_version = self.select.values[0]
         self.select.disabled = True
+        ok, err = await check_node_ipv4(self.node_id)
+        if not ok:
+            await interaction.response.edit_message(embed=create_error_embed("No IPv4 on this node", err), view=self)
+            return
         creating_embed = create_info_embed("Creating VPS", f"Deploying {os_version} VPS for {self.user.mention} on node {self.node_id}...")
         await interaction.response.edit_message(embed=creating_embed, view=self)
         user_id = str(self.user.id)
@@ -1731,7 +1855,7 @@ class OSSelectView(discord.ui.View):
             await safe_start_container(container_name, self.node_id)
             await apply_internal_permissions(container_name, self.node_id)
             root_password = await setup_ssh_access(container_name, self.node_id)
-            pinggy_address = await establish_pinggy_tunnel(container_name, self.node_id)
+            pinggy_address = await establish_ssh_access(container_name, self.node_id, user_id)
             config_str = f"{self.ram}GB RAM / {self.cpu} CPU / {self.disk}GB Disk"
             vps_info = {
                 "container_name": container_name,
@@ -1791,6 +1915,34 @@ class OSSelectView(discord.ui.View):
             error_embed = create_error_embed("Creation Failed", f"Error: {str(e)}")
             await interaction.followup.send(embed=error_embed)
 
+@bot.command(name='ipv4vps-on')
+@is_main_admin()
+async def ipv4vps_on(ctx):
+    """!ipv4vps-on - only IPv4 VPS: creating a VPS on a node without IPv4 gives an error"""
+    set_setting('ipv4_only', '1')
+    lines, missing = [], []
+    for n in get_nodes():
+        ip = await asyncio.to_thread(node_ipv4_sync, n)
+        lines.append(f"{'✅' if ip else '❌'} **{n['name']}** - {ip or 'no IPv4'}")
+        if not ip:
+            missing.append(n['name'])
+    embed = create_success_embed("IPv4-only VPS: ON", "New VPS are only created on nodes with a public IPv4, and users only get a direct IPv4 SSH address.\nNodes without IPv4 show an error instead of creating a VPS.")
+    if lines:
+        add_field(embed, "Node IPv4 check", "\n".join(lines), False)
+    if missing:
+        add_field(embed, "⚠️ Warning", f"No IPv4 on: {', '.join(missing)}. Creating a VPS there will fail until `{PREFIX}ipv4vps-off`.", False)
+    add_field(embed, "Turn off", f"`{PREFIX}ipv4vps-off` - non-IPv4 VPS allowed again", False)
+    await ctx.send(embed=embed)
+
+@bot.command(name='ipv4vps-off')
+@is_main_admin()
+async def ipv4vps_off(ctx):
+    """!ipv4vps-off - non-IPv4 (IPv6-only) servers can create VPS too"""
+    set_setting('ipv4_only', '0')
+    embed = create_success_embed("IPv4-only VPS: OFF", "VPS can now be created on every node, including nodes / servers without IPv4 (the Pinggy tunnel fallback is allowed again).")
+    add_field(embed, "Turn on", f"`{PREFIX}ipv4vps-on` - only IPv4 VPS", False)
+    await ctx.send(embed=embed)
+
 @bot.command(name='create')
 @is_admin()
 async def create_vps(ctx, ram: int, cpu: int, disk: int, user: discord.Member, days: int = None):
@@ -1844,7 +1996,7 @@ class ReinstallOSSelectView(discord.ui.View):
             await execute_lxc(self.container_name, f"start {self.container_name}", node_id=self.node_id)
             await apply_internal_permissions(self.container_name, self.node_id)
             root_password = await setup_ssh_access(self.container_name, self.node_id)
-            pinggy_address = await establish_pinggy_tunnel(self.container_name, self.node_id)
+            pinggy_address = await establish_ssh_access(self.container_name, self.node_id, self.owner_id)
             target_vps = vps_data[self.owner_id][self.actual_idx]
             target_vps["os_version"] = os_version
             target_vps["status"] = "running"
@@ -2138,7 +2290,11 @@ class ManageView(discord.ui.View):
                     if used >= allocated:
                         await modal_inter.followup.send(embed=create_error_embed("Quota Exceeded", f"No available port slots. Allocated: {allocated}, Used: {used}. Contact an admin for more."), ephemeral=True)
                         return
-                    host_port = await create_port_forward(owner_id, container_name, vps_port, node_id)
+                    try:
+                        host_port = await create_port_forward(owner_id, container_name, vps_port, node_id)
+                    except ValueError as ve:
+                        await modal_inter.followup.send(embed=create_error_embed("Not possible", str(ve)), ephemeral=True)
+                        return
                     if host_port:
                         public_ip = get_public_ip()
                         success_embed = create_success_embed("Port Forward Created", f"VPS port `{vps_port}` forwarded to host port `{host_port}` (TCP & UDP).")
@@ -2253,7 +2409,7 @@ class ManageView(discord.ui.View):
         elif action == 'reconnect_tunnel':
             try:
                 await interaction.followup.send(embed=create_info_embed("Reconnecting", "Setting up a fresh SSH tunnel, this can take up to 30 seconds..."), ephemeral=True)
-                new_address = await establish_pinggy_tunnel(container_name, node_id)
+                new_address = await establish_ssh_access(container_name, node_id, self.owner_id)
                 target_vps['pinggy_address'] = new_address
                 save_vps_data()
                 if new_address:
@@ -2963,6 +3119,12 @@ async def fix_vps(ctx, container_name: str):
         return
     # SSH password login (works for the normal tunnel and for the Tailscale IP)
     ssh = await ensure_ssh_password_login(container_name, node_id, vps.get('root_password') or None)
+    # Direct SSH on the server IPv4 (random port per VPS) instead of the Pinggy tunnel
+    owner_uid, _vrec = find_vps_by_container(container_name)
+    direct_addr = await establish_ssh_access(container_name, node_id, owner_uid) if owner_uid else None
+    if direct_addr and _vrec is not None:
+        _vrec['pinggy_address'] = direct_addr
+        save_vps_data()
     # Tailscale must restart once so it picks up /dev/net/tun (it falls back to userspace mode without it)
     restarted = False
     if report['ts_installed'] and report['tun_ok']:
@@ -2981,6 +3143,9 @@ async def fix_vps(ctx, container_name: str):
     if ssh['errors']:
         ssh_line += "\n⚠️ " + " | ".join(ssh['errors'])[:300]
     add_field(embed, "SSH password login", ssh_line, False)
+    if direct_addr:
+        h_, p_ = direct_addr.rsplit(":", 1)
+        add_field(embed, "SSH address (direct IPv4)", f"```ssh root@{h_} -p {p_}```", False)
     ts_text = f"{report['tun']}\n{report['tailscale']}"
     if restarted:
         ts_text += "\n🔄 tailscaled restarted"
@@ -5492,7 +5657,8 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}add-admin <user_id>", "Add main admin (by ID)"),
                     (f"{PREFIX}rm-admin <user_id>", "Remove main admin (by ID)"),
                     (f"{PREFIX}admin-list", "List admins"),
-                    (f"{PREFIX}prefix [new|reset]", "Show / change the bot command prefix")
+                    (f"{PREFIX}prefix [new|reset]", "Show / change the bot command prefix"),
+                    (f"{PREFIX}ipv4vps-on / {PREFIX}ipv4vps-off", "ON: only IPv4 VPS (error if node has no IPv4) / OFF: non-IPv4 VPS allowed")
                 ],
                 "admin_only": True,
                 "main_admin_only": True

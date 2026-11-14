@@ -172,3 +172,13 @@ Starts **automatically** with the bot (after install and after every update) - n
 - Unsuspend with `!unsuspend-vps <container>`.
 - CPU is measured with the second `top` sample (the first one is only the average since boot), so readings are accurate.
 - Host/node CPU/RAM/disk alerts stay in `!alerts`.
+
+## SSH on the server's own IPv4 (random port per VPS)
+
+Every new VPS now gets a direct SSH address on the bot server's public IPv4: `ssh root@<server-ip> -p <random port>`.
+Each VPS has its own random port (20000-50000) and its own random 24-character root password. The old Pinggy tunnel is only a fallback if the direct forward cannot be created.
+
+- The SSH forward is free (it does not use the user's port quota) and is re-created automatically after restarts.
+- **Open the port range 20000-50000 (TCP) in your provider's firewall / security group** (and `ufw allow 20000:50000/tcp` if ufw is on), otherwise nobody can connect.
+- Existing VPS: run `!fix-vps <container>` (or `!fix-vps all`), or press Manage -> Reconnect Tunnel. The VPS then switches from Pinggy to the direct IPv4 address; the root password stays the same (change it in Manage -> Change Password).
+- On remote nodes the node's own address (from the node URL) is shown instead of the bot server's IP.
