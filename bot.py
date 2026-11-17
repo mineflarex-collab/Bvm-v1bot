@@ -3066,8 +3066,15 @@ async def _vps_feature_report(container_name: str, node_id: int) -> Dict[str, An
 
 @bot.command(name='fix-vps')
 @is_admin()
-async def fix_vps(ctx, container_name: str):
-    """!fix-vps <container|all>  - fix Docker/Pterodactyl/Tailscale + SSH password login (no data touched)"""
+async def fix_vps(ctx, *args):
+    """!fix-vps <all | @user <vps_no|container>>  - fix Docker/Pterodactyl/Tailscale + SSH password login (no data touched)"""
+    if args and args[0].lower() == 'all':
+        container_name = 'all'
+    else:
+        res = await resolve_vps_target(ctx, args, f"{PREFIX}fix-vps @user <vps_no|container>  (or {PREFIX}fix-vps all)")
+        if res is None:
+            return
+        container_name = res[1]['container_name']
     if container_name.lower() == 'all':
         targets = [v for vl in vps_data.values() for v in vl]
         await ctx.send(embed=create_info_embed("Fixing all VPS", f"Upgrading {len(targets)} VPS one by one (tun, KVM, SSH password login, Tailscale). Running VPS are not restarted. This can take a while..."))
@@ -3159,8 +3166,12 @@ async def _find_running_vps(ctx, container_name: str):
 
 @bot.command(name='setup-docker', aliases=['fix-docker', 'setup-wings'])
 @is_admin()
-async def setup_docker_cmd(ctx, container_name: str):
-    """!setup-docker <container>  - install / repair Docker inside the VPS (needed by Pterodactyl Wings)"""
+async def setup_docker_cmd(ctx, *args):
+    """!setup-docker @user <vps_no|container>  - install / repair Docker inside the VPS (needed by Pterodactyl Wings)"""
+    res = await resolve_vps_target(ctx, args, f"{PREFIX}setup-docker @user <vps_no|container>")
+    if res is None:
+        return
+    container_name = res[1]['container_name']
     vps = await _find_running_vps(ctx, container_name)
     if vps is None:
         return
@@ -3214,8 +3225,12 @@ async def setup_docker_cmd(ctx, container_name: str):
 
 @bot.command(name='setup-snap', aliases=['fix-snap'])
 @is_admin()
-async def setup_snap_cmd(ctx, container_name: str):
-    """!setup-snap <container>  - install / repair snap (snapd) inside the VPS"""
+async def setup_snap_cmd(ctx, *args):
+    """!setup-snap @user <vps_no|container>  - install / repair snap (snapd) inside the VPS"""
+    res = await resolve_vps_target(ctx, args, f"{PREFIX}setup-snap @user <vps_no|container>")
+    if res is None:
+        return
+    container_name = res[1]['container_name']
     vps = await _find_running_vps(ctx, container_name)
     if vps is None:
         return
@@ -3262,6 +3277,59 @@ async def setup_snap_cmd(ctx, container_name: str):
 #  files / installed software / data inside the VPS stay intact.
 # ============================================================
 _transfer_lock = asyncio.Lock()
+
+
+# ============================================================
+#  VPS TARGET RESOLVER
+#  Every admin VPS command now uses the same order:
+#     <command> @user <vps_number | container> [extra...]
+#  Old style (<command> <container>) still works.
+#  If the user has only ONE VPS, the number/container can be left out.
+# ============================================================
+_MENTION_RE = re.compile(r'^<@!?(\d{15,25})>$')
+
+def _parse_user_token(tok: str):
+    m = _MENTION_RE.match(tok.strip())
+    if m:
+        return m.group(1)
+    if tok.isdigit() and len(tok) >= 15:
+        return tok
+    return None
+
+async def resolve_vps_target(ctx, args, usage: str):
+    """Returns (owner_id, vps_dict, rest_args) or None (an error was already sent)."""
+    args = list(args)
+    if not args:
+        await ctx.send(embed=create_error_embed("Missing Parameters", f"Usage: `{usage}`"))
+        return None
+    uid = _parse_user_token(args[0])
+    if uid is not None:
+        rest = args[1:]
+        user_vps = vps_data.get(uid, [])
+        if not user_vps:
+            await ctx.send(embed=create_error_embed("No VPS Found", f"<@{uid}> doesn't have any VPS."))
+            return None
+        if rest and rest[0].isdigit() and len(rest[0]) < 6:
+            n = int(rest[0])
+            if n < 1 or n > len(user_vps):
+                await ctx.send(embed=create_error_embed("VPS Not Found", f"<@{uid}> has {len(user_vps)} VPS. Use a number from 1 to {len(user_vps)}."))
+                return None
+            return uid, user_vps[n - 1], rest[1:]
+        if rest:
+            for v in user_vps:
+                if v.get('container_name', '').lower() == rest[0].lower():
+                    return uid, v, rest[1:]
+        if len(user_vps) == 1:
+            return uid, user_vps[0], rest
+        await ctx.send(embed=create_error_embed("Choose a VPS", f"<@{uid}> has {len(user_vps)} VPS. Add the VPS number (1-{len(user_vps)}) or container name.\nUsage: `{usage}`"))
+        return None
+    # old style: container name first
+    for owner, lst in vps_data.items():
+        for v in lst:
+            if v.get('container_name', '').lower() == args[0].lower():
+                return owner, v, args[1:]
+    await ctx.send(embed=create_error_embed("VPS Not Found", f"`{args[0]}` is not a user mention or a container name.\nUsage: `{usage}`\nUse `{PREFIX}list-all` to see containers."))
+    return None
 
 def find_vps_by_container(container_name: str):
     """Returns (owner_id, vps_dict) for a container, or (None, None)."""
@@ -3473,8 +3541,23 @@ class TransferConfirmView(discord.ui.View):
 
 @bot.command(name='transfer-vps')
 @is_admin()
-async def transfer_vps(ctx, container_name: str, new_owner: discord.Member, *flags):
-    """!transfer-vps <container> @new_owner [keep-shares] [keep-password]"""
+async def transfer_vps(ctx, *args):
+    """!transfer-vps @old_user <vps_no|container> @new_owner [keep-shares] [keep-password]"""
+    usage = f"{PREFIX}transfer-vps @old_user <vps_no|container> @new_owner [keep-shares] [keep-password]"
+    res = await resolve_vps_target(ctx, args, usage)
+    if res is None:
+        return
+    _owner_id, _vrec, rest = res
+    container_name = _vrec['container_name']
+    if not rest:
+        await ctx.send(embed=create_error_embed("Missing New Owner", f"Usage: `{usage}`"))
+        return
+    try:
+        new_owner = await commands.MemberConverter().convert(ctx, rest[0])
+    except Exception:
+        await ctx.send(embed=create_error_embed("Invalid User", f"Could not find the new owner `{rest[0]}`.\nUsage: `{usage}`"))
+        return
+    flags = rest[1:]
     flags = {f.lower() for f in flags}
     unknown = flags - {'keep-shares', 'keep-password'}
     if unknown:
@@ -4783,93 +4866,86 @@ async def vps_uptime(ctx, container_name: str):
 
 @bot.command(name='suspend-vps')
 @is_admin()
-async def suspend_vps(ctx, container_name: str, *, reason: str = "Admin action"):
-    node_id = find_node_id_for_container(container_name)
-    found = False
-    for uid, lst in vps_data.items():
-        for vps in lst:
-            if vps['container_name'] == container_name:
-                if vps.get('status') != 'running':
-                    await ctx.send(embed=create_error_embed("Cannot Suspend", "VPS must be running to suspend."))
-                    return
-                try:
-                    await execute_lxc(container_name, f"stop {container_name}", node_id=node_id)
-                    vps['status'] = 'stopped'
-                    vps['suspended'] = True
-                    if 'suspension_history' not in vps:
-                        vps['suspension_history'] = []
-                    vps['suspension_history'].append({
-                        'time': datetime.now().isoformat(),
-                        'reason': reason,
-                        'by': f"{ctx.author.name} ({ctx.author.id})"
-                    })
-                    save_vps_data()
-                except Exception as e:
-                    await ctx.send(embed=create_error_embed("Suspend Failed", str(e)))
-                    return
-                try:
-                    owner = await bot.fetch_user(int(uid))
-                    embed = create_warning_embed("🚨 VPS Suspended", f"Your VPS `{container_name}` has been suspended by an admin.\n\n**Reason:** {reason}\n\nContact an admin to unsuspend.")
-                    await owner.send(embed=embed)
-                except Exception as dm_e:
-                    logger.error(f"Failed to DM owner {uid}: {dm_e}")
-                await ctx.send(embed=create_success_embed("VPS Suspended", f"VPS `{container_name}` suspended. Reason: {reason}"))
-                found = True
-                break
-        if found:
-            break
-    if not found:
-        await ctx.send(embed=create_error_embed("Not Found", f"VPS `{container_name}` not found."))
+async def suspend_vps(ctx, *args):
+    """!suspend-vps @user <vps_no|container> [reason]"""
+    res = await resolve_vps_target(ctx, args, f"{PREFIX}suspend-vps @user <vps_no|container> [reason]")
+    if res is None:
+        return
+    uid, vps, rest = res
+    container_name = vps['container_name']
+    node_id = vps.get('node_id') or find_node_id_for_container(container_name)
+    reason = " ".join(rest).strip() or "Admin action"
+    if vps.get('suspended', False):
+        await ctx.send(embed=create_error_embed("Already Suspended", f"VPS `{container_name}` is already suspended."))
+        return
+    try:
+        try:
+            await execute_lxc(container_name, f"stop {container_name} --force", node_id=node_id)
+        except Exception as stop_e:
+            e = str(stop_e).lower()
+            if not any(x in e for x in ("already", "not running", "stopped")):
+                raise
+        vps['status'] = 'stopped'
+        vps['suspended'] = True
+        vps.setdefault('suspension_history', []).append({
+            'time': datetime.now().isoformat(),
+            'reason': reason,
+            'by': f"{ctx.author.name} ({ctx.author.id})"
+        })
+        save_vps_data()
+    except Exception as e:
+        await ctx.send(embed=create_error_embed("Suspend Failed", str(e)[:900]))
+        return
+    try:
+        owner = await bot.fetch_user(int(uid))
+        await owner.send(embed=create_warning_embed("🚨 VPS Suspended", f"Your VPS `{container_name}` has been suspended by an admin.\n\n**Reason:** {reason}\n\nContact an admin to unsuspend."))
+    except Exception as dm_e:
+        logger.error(f"Failed to DM owner {uid}: {dm_e}")
+    await ctx.send(embed=create_success_embed("VPS Suspended", f"VPS `{container_name}` of <@{uid}> suspended.\nReason: {reason}"))
 
 @bot.command(name='unsuspend-vps')
 @is_admin()
-async def unsuspend_vps(ctx, container_name: str):
-    node_id = find_node_id_for_container(container_name)
-    found = False
-    for uid, lst in vps_data.items():
-        for vps in lst:
-            if vps['container_name'] == container_name:
-                if not vps.get('suspended', False):
-                    await ctx.send(embed=create_error_embed("Not Suspended", "VPS is not suspended."))
-                    return
-                try:
-                    vps['suspended'] = False
-                    vps['status'] = 'running'
-                    await safe_start_container(container_name, node_id)
-                    await apply_internal_permissions(container_name, node_id)
-                    await recreate_port_forwards(container_name)
-                    save_vps_data()
-                    await ctx.send(embed=create_success_embed("VPS Unsuspended", f"VPS `{container_name}` unsuspended and started."))
-                    found = True
-                except Exception as e:
-                    await ctx.send(embed=create_error_embed("Start Failed", str(e)))
-                try:
-                    owner = await bot.fetch_user(int(uid))
-                    embed = create_success_embed("🟢 VPS Unsuspended", f"Your VPS `{container_name}` has been unsuspended by an admin.\nYou can now manage it again.")
-                    await owner.send(embed=embed)
-                except Exception as dm_e:
-                    logger.error(f"Failed to DM owner {uid} about unsuspension: {dm_e}")
-                break
-        if found:
-            break
-    if not found:
-        await ctx.send(embed=create_error_embed("Not Found", f"VPS `{container_name}` not found."))
+async def unsuspend_vps(ctx, *args):
+    """!unsuspend-vps @user <vps_no|container>"""
+    res = await resolve_vps_target(ctx, args, f"{PREFIX}unsuspend-vps @user <vps_no|container>")
+    if res is None:
+        return
+    uid, vps, _rest = res
+    container_name = vps['container_name']
+    node_id = vps.get('node_id') or find_node_id_for_container(container_name)
+    if not vps.get('suspended', False):
+        await ctx.send(embed=create_error_embed("Not Suspended", f"VPS `{container_name}` is not suspended."))
+        return
+    try:
+        vps['suspended'] = False
+        vps['status'] = 'running'
+        await safe_start_container(container_name, node_id)
+        await apply_internal_permissions(container_name, node_id)
+        await recreate_port_forwards(container_name)
+        save_vps_data()
+    except Exception as e:
+        vps['suspended'] = True
+        vps['status'] = 'stopped'
+        save_vps_data()
+        await ctx.send(embed=create_error_embed("Start Failed", str(e)[:900]))
+        return
+    await ctx.send(embed=create_success_embed("VPS Unsuspended", f"VPS `{container_name}` of <@{uid}> unsuspended and started."))
+    try:
+        owner = await bot.fetch_user(int(uid))
+        await owner.send(embed=create_success_embed("🟢 VPS Unsuspended", f"Your VPS `{container_name}` has been unsuspended by an admin.\nYou can now manage it again."))
+    except Exception as dm_e:
+        logger.error(f"Failed to DM owner {uid} about unsuspension: {dm_e}")
 
 @bot.command(name='suspension-logs')
 @is_admin()
-async def suspension_logs(ctx, container_name: str = None):
-    if container_name:
-        found = None
-        for lst in vps_data.values():
-            for vps in lst:
-                if vps['container_name'] == container_name:
-                    found = vps
-                    break
-            if found:
-                break
-        if not found:
-            await ctx.send(embed=create_error_embed("Not Found", f"VPS `{container_name}` not found."))
+async def suspension_logs(ctx, *args):
+    """!suspension-logs [@user <vps_no|container>]"""
+    if args:
+        res = await resolve_vps_target(ctx, args, f"{PREFIX}suspension-logs [@user <vps_no|container>]")
+        if res is None:
             return
+        _uid, found, _rest = res
+        container_name = found['container_name']
         history = found.get('suspension_history', [])
         if not history:
             await ctx.send(embed=create_info_embed("No Suspensions", f"No suspension history for `{container_name}`."))
@@ -4969,28 +5045,26 @@ async def resource_check(ctx):
 
 @bot.command(name='whitelist-vps')
 @is_admin()
-async def whitelist_vps(ctx, container_name: str, action: str):
-    if action.lower() not in ['add', 'remove']:
-        await ctx.send(embed=create_error_embed("Invalid Action", f"Use: `{PREFIX}whitelist-vps <container> <add|remove>`"))
+async def whitelist_vps(ctx, *args):
+    """!whitelist-vps @user <vps_no|container> <add|remove>"""
+    usage = f"{PREFIX}whitelist-vps @user <vps_no|container> <add|remove>"
+    res = await resolve_vps_target(ctx, args, usage)
+    if res is None:
         return
-    found = False
-    for user_id, vps_list in vps_data.items():
-        for vps in vps_list:
-            if vps['container_name'] == container_name:
-                if action.lower() == 'add':
-                    vps['whitelisted'] = True
-                    msg = "added to whitelist (exempt from auto-suspension)"
-                else:
-                    vps['whitelisted'] = False
-                    msg = "removed from whitelist"
-                save_vps_data()
-                await ctx.send(embed=create_success_embed("Whitelist Updated", f"VPS `{container_name}` {msg}."))
-                found = True
-                break
-        if found:
-            break
-    if not found:
-        await ctx.send(embed=create_error_embed("Not Found", f"VPS `{container_name}` not found."))
+    uid, vps, rest = res
+    action = (rest[0] if rest else "").lower()
+    if action not in ('add', 'remove'):
+        await ctx.send(embed=create_error_embed("Invalid Action", f"Use: `{usage}`"))
+        return
+    container_name = vps['container_name']
+    if action == 'add':
+        vps['whitelisted'] = True
+        msg = "added to whitelist (exempt from auto-suspension)"
+    else:
+        vps['whitelisted'] = False
+        msg = "removed from whitelist"
+    save_vps_data()
+    await ctx.send(embed=create_success_embed("Whitelist Updated", f"VPS `{container_name}` of <@{uid}> {msg}."))
 
 @bot.command(name='snapshot')
 @is_admin()
@@ -5594,16 +5668,16 @@ class HelpView(discord.ui.View):
                     (f"{PREFIX}lxc-list", "List all LXC containers"),
                     (f"{PREFIX}create <ram_gb> <cpu_cores> <disk_gb> @user [expiry_days]", "Create VPS with OS selection (+ optional expiry days)"),
                     (f"{PREFIX}delete-vps @user <vps_number> [reason]", "Delete user's VPS"),
-                    (f"{PREFIX}transfer-vps <container> @new_owner [keep-shares] [keep-password]", "Transfer a VPS to another user (data is kept)"),
-                    (f"{PREFIX}fix-vps <container|all>", "Fix Docker/Pterodactyl/Tailscale + SSH password login on a VPS"),
-                    (f"{PREFIX}setup-docker <container>", "Install/repair Docker (Pterodactyl Wings) inside a VPS"),
-                    (f"{PREFIX}setup-snap <container>", "Install/repair snap inside a VPS"),
+                    (f"{PREFIX}transfer-vps @old_user <vps_no|container> @new_owner [keep-shares] [keep-password]", "Transfer a VPS to another user (data is kept)"),
+                    (f"{PREFIX}fix-vps <all | @user <vps_no|container>>", "Fix Docker/Pterodactyl/Tailscale + SSH password login on a VPS"),
+                    (f"{PREFIX}setup-docker @user <vps_no|container>", "Install/repair Docker (Pterodactyl Wings) inside a VPS"),
+                    (f"{PREFIX}setup-snap @user <vps_no|container>", "Install/repair snap inside a VPS"),
                     (f"{PREFIX}add-resources <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Add resources to VPS"),
                     (f"{PREFIX}resize-vps <ram_gb> <cpu> <disk_gb> @user [vps_no]", "Resize VPS resources"),
-                    (f"{PREFIX}suspend-vps <container> [reason]", "Suspend VPS"),
-                    (f"{PREFIX}unsuspend-vps <container>", "Unsuspend VPS"),
-                    (f"{PREFIX}suspension-logs [container]", "View suspension logs"),
-                    (f"{PREFIX}whitelist-vps <container> <add|remove>", "Whitelist VPS from auto-suspend"),
+                    (f"{PREFIX}suspend-vps @user <vps_no|container> [reason]", "Suspend VPS"),
+                    (f"{PREFIX}unsuspend-vps @user <vps_no|container>", "Unsuspend VPS"),
+                    (f"{PREFIX}suspension-logs [@user <vps_no|container>]", "View suspension logs"),
+                    (f"{PREFIX}whitelist-vps @user <vps_no|container> <add|remove>", "Whitelist VPS from auto-suspend"),
                     (f"{PREFIX}userinfo @user", "User information"),
                     (f"{PREFIX}list-all", "List all VPS"),
                     (f"{PREFIX}exec <container> <command>", "Execute command"),
